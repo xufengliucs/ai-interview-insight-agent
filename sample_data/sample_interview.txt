@@ -1,0 +1,39 @@
+Interviewer: Thanks for joining us today. Can you start by telling us a bit about how you currently manage your personal finances?
+
+Customer: Sure. I use a couple of different apps — mostly my bank's built-in app and a spreadsheet I made a few years ago. It gets messy. I have to manually update things constantly and it just doesn't give me the full picture.
+
+Interviewer: What frustrates you most about the tools you're using right now?
+
+Customer: Honestly, the biggest thing is subscriptions. I have like fifteen of them and I never know when they're going to hit. I got charged for a service I forgot I even signed up for last month. It was only twelve dollars but it's the principle — I should know this is coming.
+
+Interviewer: Have you tried any budgeting apps specifically?
+
+Customer: Yeah, I tried Mint for about six months. It was fine at first but the bank sync broke constantly. Like I'd open the app and my accounts just wouldn't refresh. I'd have to manually trigger the sync and half the time it would just fail silently. That drove me insane.
+
+Interviewer: What did you do when that happened?
+
+Customer: I just stopped trusting it. That's the thing — once you don't trust the data, the whole app is useless. I'd rather just look at my bank statement directly.
+
+Interviewer: Did you ever contact support about the sync issues?
+
+Customer: I submitted a ticket. Took four days to get a response and the answer was basically "try reconnecting your account." Super unhelpful. The onboarding was actually fine — I got set up pretty quickly — but once something went wrong there was no guidance. You were just on your own.
+
+Interviewer: If you could wave a magic wand and fix one thing, what would it be?
+
+Customer: Smart subscription tracking. Like, it should just know — here are your recurring charges, here's when they're hitting, here's what you spent on them last year. Without me having to set anything up manually. That would genuinely change how I manage money.
+
+Interviewer: What about the notification experience? Do you use any financial alerts?
+
+Customer: I have them turned on but I basically ignore them now. My bank sends me a notification every single time I spend anything over five dollars. It's just noise. I need signal, not noise. Like, alert me when something unusual happens, not every time I buy a coffee.
+
+Interviewer: Makes sense. What would "unusual" mean to you?
+
+Customer: Like if a subscription charge is different from last month. Or if I'm trending over budget in a category. Or if a charge happens in the middle of the night. Something that requires my attention, not something I already know about.
+
+Interviewer: How do you feel about sharing your financial data with these apps?
+
+Customer: Honestly I'm a bit uneasy. I don't fully understand what they do with it. Mint getting acquired by Credit Karma didn't feel great. I wish there was more transparency — like tell me exactly what data you're storing and why. I'd be more willing to connect everything if I felt like I understood the tradeoff.
+
+Interviewer: Last question — what would make you actually stick with a budgeting app long-term?
+
+Customer: Reliability, honestly. Just work consistently. And give me control. I want to be able to snooze notifications, customize what I get alerted about, set my own budget categories. The apps I've tried feel very one-size-fits-all. My financial life is specific to me. I want something that adapts.
