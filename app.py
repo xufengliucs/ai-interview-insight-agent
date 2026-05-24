@@ -147,6 +147,27 @@ st.markdown("""
   .badge-neutral { background: #f1f5f9; color: #475569; padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 500; }
   .badge-mixed { background: #faf5ff; color: #7c3aed; padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 500; }
 
+  .section-divider {
+    height: 1px;
+    background: #e2e8f0;
+    margin: 2rem 0;
+  }
+  .insight-card {
+    background: #1e293b;
+    color: white;
+    border-radius: 12px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  }
+  .insight-card h4 {
+    color: #94a3b8;
+    font-size: 0.85rem;
+    letter-spacing: 1px;
+    margin-top: 0;
+    margin-bottom: 0.75rem;
+  }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -259,7 +280,8 @@ if st.session_state.last_embedding_backend != embedding_backend:
         if embedding_backend == "openai" and not openai_key:
             st.session_state.collection = None
         else:
-            refresh_collection(embedding_backend)
+                with st.spinner("Switching embedding backend and rebuilding index..."):
+                    refresh_collection(embedding_backend)
     except Exception as exc:
         st.session_state.collection = None
         st.sidebar.error(f"Could not build embedders: {exc}")
@@ -297,7 +319,7 @@ with tabs[0]:
 
     if interview_count:
         st.markdown("### Interview coverage")
-        st.write(segment_counts)
+        st.bar_chart(segment_counts)
     else:
         st.info("Upload at least one transcript to start building your research project.")
 
@@ -376,6 +398,7 @@ def _load_demo_project():
     st.session_state.pending_notes = first["notes"]
 
     refresh_collection(st.session_state.last_embedding_backend or "local")
+    st.rerun()
 
 
 def _clear_intake_form():
@@ -396,7 +419,8 @@ def highlight_keywords(text: str, query: str) -> str:
         return escaped_text
     
     # Extract words longer than 2 characters from the query
-    words = [w for w in re.split(r'\W+', query) if len(w) > 2]
+    # Safety: ensure the extracted query words are also escaped to prevent XSS
+    words = [html.escape(w) for w in re.split(r'\W+', query) if len(w) > 2]
     if not words:
         return escaped_text
         
@@ -425,8 +449,8 @@ with tabs[1]:
 
     if st.button("🚀 Load full demo project (3 interviews)", type="secondary", help="Instantly populates the system with 3 realistic interviews to test cross-session insights."):
         with st.spinner("Building demo project..."):
+            st.toast("✅ Demo project loaded!")
             _load_demo_project()
-            st.success("✅ Demo project loaded! Head over to the **Research** or **Insights** tabs to explore.")
 
     if upload_file is not None:
         # Ensure we only read the file once when it's uploaded/changed
@@ -519,6 +543,18 @@ with tabs[1]:
                 st.markdown(f"**Participant:** {entry.get('participant_name', 'N/A')} &nbsp; | &nbsp; **Notes:** {entry.get('notes', 'None')}")
                 st.markdown("**Transcript:**")
                 st.text_area("Transcript content", value=entry["text"], height=150, disabled=True, label_visibility="collapsed", key=f"proj_entry_{i}")
+                
+                if st.button("🗑️ Remove this interview", key=f"remove_entry_{i}"):
+                    st.session_state.project_entries.pop(i)
+                    st.session_state.all_chunks = []
+                    for remaining_entry in st.session_state.project_entries:
+                        st.session_state.all_chunks.extend(chunk_transcript(remaining_entry["text"]))
+                    st.session_state.search_results = None
+                    st.session_state.aggregate_insights = None
+                    st.session_state.evaluation_data = None
+                    with st.spinner("Rebuilding index..."):
+                        refresh_collection(st.session_state.last_embedding_backend or "local")
+                    st.rerun()
     else:
         st.info("No interviews added yet. Use the uploader above to begin.")
 
@@ -653,51 +689,48 @@ with tabs[3]:
         st.markdown("## Evidence-backed Insight")
         st.caption("Generate a focused insight card from a specific topic and the supporting quotes retrieved above.")
 
-        if st.session_state.collection is None:
-            st.markdown('<div class="empty-state">⬆️ Upload a transcript and run a search first.</div>', unsafe_allow_html=True)
-        else:
-            topic_col, btn_col2 = st.columns([4, 1])
+        topic_col, btn_col2 = st.columns([4, 1])
 
-            with topic_col:
-                insight_topic = st.text_input(
-                    "Insight topic",
-                    placeholder="e.g. subscription tracking frustration",
-                    label_visibility="collapsed",
-                    key="insight_topic_input",
-                )
+        with topic_col:
+            insight_topic = st.text_input(
+                "Insight topic",
+                placeholder="e.g. subscription tracking frustration",
+                label_visibility="collapsed",
+                key="insight_topic_input",
+            )
 
-            with btn_col2:
-                evidence_clicked = st.button(
-                    "💡 Generate",
-                    use_container_width=True,
-                    type="primary",
-                    disabled=not llm_ready,
-                )
-                if not llm_ready:
-                    st.caption("LLM key required for evidence-backed insight generation.")
+        with btn_col2:
+            evidence_clicked = st.button(
+                "💡 Generate",
+                use_container_width=True,
+                type="primary",
+                disabled=not llm_ready,
+            )
+            if not llm_ready:
+                st.caption("LLM key required for evidence-backed insight generation.")
 
-            if evidence_clicked and insight_topic:
-                with st.spinner("Retrieving evidence and synthesizing insight…"):
-                    try:
-                        hits = semantic_search(
-                            insight_topic,
-                            st.session_state.collection,
-                            n_results=6,
+        if evidence_clicked and insight_topic:
+            with st.spinner("Retrieving evidence and synthesizing insight…"):
+                try:
+                    hits = semantic_search(
+                        insight_topic,
+                        st.session_state.collection,
+                        n_results=6,
+                    )
+                    quotes = extract_quotes_from_hits(hits, min_score=0.2)
+
+                    if not quotes:
+                        st.warning("No strong quotes found for this topic. Try rephrasing.")
+                    else:
+                        insight = generate_evidence_insight(
+                            topic=insight_topic,
+                            quotes=quotes[:4],
+                            backend=llm_backend,
                         )
-                        quotes = extract_quotes_from_hits(hits, min_score=0.2)
-
-                        if not quotes:
-                            st.warning("No strong quotes found for this topic. Try rephrasing.")
-                        else:
-                            insight = generate_evidence_insight(
-                                topic=insight_topic,
-                                quotes=quotes[:4],
-                                backend=llm_backend,
-                            )
-                            st.session_state.evidence_insight = insight
-                    except Exception as e:
-                        st.error(f"Evidence insight failed: {e}")
-                        logger.exception("Evidence insight error")
+                        st.session_state.evidence_insight = insight
+                except Exception as e:
+                    st.error(f"Evidence insight failed: {e}")
+                    logger.exception("Evidence insight error")
 
             if st.session_state.evidence_insight:
                 ev = st.session_state.evidence_insight
@@ -934,6 +967,9 @@ with tabs[4]:
     if not st.session_state.project_entries:
         st.markdown('<div class="empty-state">No project data available to export.</div>', unsafe_allow_html=True)
     else:
+            if not st.session_state.aggregate_insights:
+                st.info("💡 You have transcripts loaded, but haven't generated insights yet. Head over to the **Insights** tab to generate them before exporting your final report!")
+
         export_package = {
             "project_entries": [
                 {
