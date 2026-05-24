@@ -298,6 +298,28 @@ with tabs[0]:
     )
 
 
+def _set_sample_transcript():
+    sample = load_sample_transcript()
+    if sample:
+        st.session_state.pending_transcript = sample
+        st.session_state.pending_name = "Sample interview"
+        st.session_state.pending_participant_name = "Sample participant"
+        st.session_state.pending_segment = "Product research"
+        st.session_state.pending_role = "Product manager"
+        st.session_state.pending_notes = "Loaded from sample data for quick testing."
+    else:
+        st.error("Sample transcript file not found.")
+
+
+def _clear_intake_form():
+    st.session_state.pending_transcript = ""
+    st.session_state.pending_name = ""
+    st.session_state.pending_participant_name = ""
+    st.session_state.pending_segment = ""
+    st.session_state.pending_role = ""
+    st.session_state.pending_notes = ""
+
+
 with tabs[1]:
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("## 01 · Interview ingestion")
@@ -308,17 +330,7 @@ with tabs[1]:
         help="Upload interview transcripts or meeting notes for semantic search and insight generation.",
     )
 
-    if st.button("Load sample transcript", type="secondary"):
-        sample = load_sample_transcript()
-        if sample:
-            st.session_state.pending_transcript = sample
-            st.session_state.pending_name = "Sample interview"
-            st.session_state.pending_participant_name = "Sample participant"
-            st.session_state.pending_segment = "Product research"
-            st.session_state.pending_role = "Product manager"
-            st.session_state.pending_notes = "Loaded from sample data for quick testing."
-        else:
-            st.error("Sample transcript file not found.")
+    st.button("Load sample transcript", type="secondary", on_click=_set_sample_transcript)
 
     if upload_file is not None:
         try:
@@ -329,7 +341,6 @@ with tabs[1]:
 
     st.text_area(
         "Transcript preview",
-        value=st.session_state.pending_transcript,
         key="pending_transcript",
         height=240,
     )
@@ -341,7 +352,7 @@ with tabs[1]:
     st.text_area("Notes", key="pending_notes", height=120)
 
     add_clicked = st.button("Add interview to project", type="primary")
-    clear_clicked = st.button("Clear form", type="secondary")
+    st.button("Clear form", type="secondary", on_click=_clear_intake_form)
 
     if add_clicked:
         if not st.session_state.pending_transcript.strip():
@@ -372,14 +383,6 @@ with tabs[1]:
                 st.success("Interview added to the project and indexed for search.")
             except Exception as exc:
                 st.error(f"Failed to add interview: {exc}")
-
-    if clear_clicked:
-        st.session_state.pending_transcript = ""
-        st.session_state.pending_name = ""
-        st.session_state.pending_participant_name = ""
-        st.session_state.pending_segment = ""
-        st.session_state.pending_role = ""
-        st.session_state.pending_notes = ""
 
     if st.session_state.project_entries:
         st.markdown("### Project interviews")

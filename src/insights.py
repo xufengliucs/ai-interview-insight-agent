@@ -24,6 +24,57 @@ def _clean_json_response(raw: str) -> str:
     return raw.strip()
 
 
+def _attempt_fix_json(cleaned: str) -> str:
+    """Try to repair common JSON formatting issues from LLM output."""
+    fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
+    fixed = fixed.strip()
+
+    # If raw output contains leading text before JSON, strip to the first JSON opener.
+    first_json = re.search(r"[\{\[]", fixed)
+    if first_json:
+        fixed = fixed[first_json.start():]
+
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    last_top_level_end: int | None = None
+
+    for idx, ch in enumerate(fixed):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch == '}' and stack and stack[-1] == '{':
+            stack.pop()
+            if not stack:
+                last_top_level_end = idx
+        elif ch == ']' and stack and stack[-1] == '[':
+            stack.pop()
+            if not stack:
+                last_top_level_end = idx
+
+    if in_string:
+        fixed += '"'
+
+    if stack:
+        while stack:
+            opener = stack.pop()
+            fixed += '}' if opener == '{' else ']'
+    elif last_top_level_end is not None and last_top_level_end < len(fixed) - 1:
+        fixed = fixed[: last_top_level_end + 1]
+
+    return fixed
+
+
 def extract_themes(
     transcript: str,
     backend: LLMBackend = "openai",
@@ -52,8 +103,13 @@ def extract_themes(
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
-        raise ValueError(f"LLM returned invalid JSON: {e}")
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
+            logger.debug(f"Attempted fixed JSON:\n{fixed}")
+            raise ValueError(f"LLM returned invalid JSON: {e}")
 
 
 def generate_evidence_insight(
@@ -86,8 +142,13 @@ def generate_evidence_insight(
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
-        raise ValueError(f"LLM returned invalid JSON: {e}")
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
+            logger.debug(f"Attempted fixed JSON:\n{fixed}")
+            raise ValueError(f"LLM returned invalid JSON: {e}")
 
 
 def extract_aggregate_insights(
@@ -122,14 +183,19 @@ def extract_aggregate_insights(
     prompt = AGGREGATE_INSIGHT_PROMPT.format(transcripts=transcripts_str)
     logger.info(f"Extracting aggregate research insights using {backend}.")
 
-    raw = _call_llm(prompt, backend=backend, model=model)
+    raw = _call_llm(prompt, backend=backend, model=model, max_tokens=4096)
     cleaned = _clean_json_response(raw)
 
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
-        raise ValueError(f"LLM returned invalid JSON: {e}")
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
+            logger.debug(f"Attempted fixed JSON:\n{fixed}")
+            raise ValueError(f"LLM returned invalid JSON: {e}")
 
 
 def answer_research_query(
@@ -162,8 +228,13 @@ def answer_research_query(
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
-        raise ValueError(f"LLM returned invalid JSON: {e}")
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            logger.error(f"JSON parse error: {e}\nRaw response:\n{raw}")
+            logger.debug(f"Attempted fixed JSON:\n{fixed}")
+            raise ValueError(f"LLM returned invalid JSON: {e}")
 
 
 def _call_llm(

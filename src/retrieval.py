@@ -157,9 +157,15 @@ def semantic_search(
     """
     logger.info(f"Searching for: '{query}' (top {n_results})")
 
+    total_docs = collection.count()
+    if total_docs == 0:
+        logger.warning("Collection is empty; returning no search results.")
+        return []
+
+    n_results = max(1, min(n_results, total_docs))
     results = collection.query(
         query_texts=[query],
-        n_results=min(n_results, collection.count()),
+        n_results=n_results,
         include=["documents", "distances", "metadatas"],
     )
 
