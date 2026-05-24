@@ -17,50 +17,87 @@ LLMBackend = str  # "openai" | "gemini"
 
 
 def _clean_json_response(raw: str) -> str:
-    """Strip markdown fences and whitespace from an LLM JSON response."""
+    """Extract JSON block even if hidden inside markdown with conversational text."""
     raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    # Look for a markdown code block anywhere in the text
+    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL)
+    if match:
+        return match.group(1).strip()
     return raw.strip()
 
 
 def _attempt_fix_json(cleaned: str) -> str:
     """Try to repair common JSON formatting issues from LLM output."""
-    fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-    fixed = fixed.strip()
-
     # If raw output contains leading text before JSON, strip to the first JSON opener.
-    first_json = re.search(r"[\{\[]", fixed)
+    first_json = re.search(r"[\{\[]", cleaned)
     if first_json:
-        fixed = fixed[first_json.start():]
+        cleaned = cleaned[first_json.start():]
+
+    # Fallback heuristic: Fix Pythonic booleans/nulls often hallucinated by LLMs
+    cleaned = re.sub(r'\bTrue\b', 'true', cleaned)
+    cleaned = re.sub(r'\bFalse\b', 'false', cleaned)
+    cleaned = re.sub(r'\bNone\b', 'null', cleaned)
 
     stack: list[str] = []
     in_string = False
     escape = False
     last_top_level_end: int | None = None
+    fixed_chars: list[str] = []
 
-    for idx, ch in enumerate(fixed):
+    def _insert_comma_if_needed():
+        # Look backwards to see if we missed a comma between properties
+        for prev in reversed(fixed_chars):
+            if not prev.isspace():
+                # If the previous meaningful char is the end of a value (", }, ])
+                # or an alphanumeric char (end of true, false, null, or a digit)
+                if prev in '\"}]' or prev.isalnum():
+                    fixed_chars.append(',')
+                break
+
+    for ch in cleaned:
         if escape:
             escape = False
+            fixed_chars.append(ch)
             continue
         if ch == "\\":
             escape = True
+            fixed_chars.append(ch)
             continue
         if ch == '"':
+            if not in_string:
+                _insert_comma_if_needed()
             in_string = not in_string
+            fixed_chars.append(ch)
             continue
         if in_string:
+            fixed_chars.append(ch)
             continue
+            
+        # --- Safe manipulation outside of strings ---
+        if ch in '{[':
+            _insert_comma_if_needed()
+
+        if ch in '}]':
+            # Strip trailing commas safely before a closing bracket
+            while fixed_chars and fixed_chars[-1].isspace():
+                fixed_chars.pop()
+            if fixed_chars and fixed_chars[-1] == ',':
+                fixed_chars.pop()
+                
+        fixed_chars.append(ch)
+
         if ch in '{[':
             stack.append(ch)
         elif ch == '}' and stack and stack[-1] == '{':
             stack.pop()
             if not stack:
-                last_top_level_end = idx
+                last_top_level_end = len(fixed_chars) - 1
         elif ch == ']' and stack and stack[-1] == '[':
             stack.pop()
             if not stack:
-                last_top_level_end = idx
+                last_top_level_end = len(fixed_chars) - 1
+
+    fixed = "".join(fixed_chars)
 
     if in_string:
         fixed += '"'
@@ -237,6 +274,60 @@ def answer_research_query(
             raise ValueError(f"LLM returned invalid JSON: {e}")
 
 
+def expand_research_query(
+    query: str,
+    backend: LLMBackend = "openai",
+    model: str | None = None,
+) -> list[str]:
+    """
+    Expand a single query into multiple alternative phrasings to improve retrieval recall.
+    """
+    from src.prompts import QUERY_EXPANSION_PROMPT
+
+    prompt = QUERY_EXPANSION_PROMPT.format(query=query)
+    logger.info(f"Expanding search query: '{query}'")
+
+    raw = _call_llm(prompt, backend=backend, model=model)
+    cleaned = _clean_json_response(raw)
+
+    try:
+        expansions = json.loads(cleaned)
+    except json.JSONDecodeError:
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            expansions = json.loads(fixed)
+        except json.JSONDecodeError:
+            expansions = []
+            
+    if isinstance(expansions, list) and expansions:
+        return [query] + [str(e) for e in expansions]
+    return [query]
+
+
+def format_transcript_dialogue(
+    transcript: str,
+    backend: LLMBackend = "openai",
+    model: str | None = None,
+) -> str:
+    """
+    Use an LLM to add speaker labels (diarization) to a raw text wall.
+    """
+    from src.prompts import DIARIZE_PROMPT
+
+    prompt = DIARIZE_PROMPT.format(transcript=transcript)
+    logger.info(f"Formatting transcript dialogue using {backend}.")
+
+    # Increase max_tokens significantly as we are rewriting the entire transcript
+    raw = _call_llm(prompt, backend=backend, model=model, max_tokens=8192)
+    
+    # Clean up accidental markdown formatting the LLM might have applied
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:text|markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    
+    return cleaned.strip()
+
+
 def _call_llm(
     prompt: str,
     backend: LLMBackend = "openai",
@@ -252,6 +343,8 @@ def _call_llm(
         return _call_openai(prompt, model=model or "gpt-4o-mini", max_tokens=max_tokens)
     elif backend == "gemini":
         return _call_gemini(prompt, model=model or "models/gemini-2.5-flash", max_tokens=max_tokens)
+    elif backend == "ollama":
+        return _call_ollama(prompt, model=model or "llama3", max_tokens=max_tokens)
     else:
         raise ValueError(f"Unknown LLM backend: '{backend}'. Use 'openai' or 'gemini'.")
 
@@ -275,6 +368,24 @@ def _call_openai(prompt: str, model: str, max_tokens: int) -> str:
         temperature=0.3,  # low temp for consistent structured output
     )
 
+    return response.choices[0].message.content
+
+
+def _call_ollama(prompt: str, model: str, max_tokens: int) -> str:
+    """Call local Ollama using the OpenAI compatible endpoint."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError("openai package not installed. Run: pip install openai")
+
+    # Ollama's default local API endpoint
+    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama-local")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.3,
+    )
     return response.choices[0].message.content
 
 

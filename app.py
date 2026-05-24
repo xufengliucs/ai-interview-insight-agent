@@ -8,6 +8,8 @@ Streamlit UI — upload a transcript and surface themes, quotes, and insights.
 import json
 import logging
 import os
+import re
+import html
 import sys
 import hashlib
 from collections import Counter
@@ -169,6 +171,7 @@ def init_session_state():
         "pending_role": "",
         "pending_notes": "",
         "last_embedding_backend": None,
+        "last_uploaded_file_id": None,
     }
 
     for key, value in defaults.items():
@@ -201,7 +204,11 @@ gemini_key = os.getenv("GEMINI_API_KEY")
 
 with st.sidebar:
     st.header("Settings")
-    llm_backend = st.selectbox("LLM backend", ["openai", "gemini"], index=0)
+    llm_backend = st.selectbox(
+        "LLM backend", 
+        ["openai", "gemini", "ollama"], 
+        index=2 if not openai_key and not gemini_key else 0
+    )
     embedding_backend = st.selectbox("Embedding backend", ["openai", "local"], index=1)
     n_results = st.slider("Search results", 2, 10, 5)
     st.markdown("---")
@@ -229,13 +236,17 @@ with st.sidebar:
         st.warning(
             "Gemini key missing. Research assistant, insight extraction, and evaluation features will not work until `GEMINI_API_KEY` is available."
         )
+    elif llm_backend == "ollama":
+        st.info(
+            "Using local Ollama. Ensure Ollama is running on your machine (e.g., `ollama run llama3`)."
+        )
     else:
         st.info(f"LLM backend set to **{llm_backend}**.")
 
     st.markdown("---")
     st.markdown(
         "### Quick start\n"
-        "1. Upload a transcript or load the sample.\n"
+        "1. Upload a transcript or click **Load demo project**.\n"
         "2. Choose `local` embeddings to try without a key.\n"
         "3. Use the Research tab for semantic search.\n"
         "4. Add an LLM key later for full insights and evaluation."
@@ -275,6 +286,7 @@ with tabs[0]:
     llm_ready = (
         (llm_backend == "openai" and bool(openai_key))
         or (llm_backend == "gemini" and bool(gemini_key))
+        or (llm_backend == "ollama")
     )
 
     cols = st.columns(4)
@@ -311,6 +323,61 @@ def _set_sample_transcript():
         st.error("Sample transcript file not found.")
 
 
+def _load_demo_project():
+    """Instantly inject 3 realistic mock interviews to let users test cross-session insights."""
+    demo_interviews = [
+        {
+            "name": "Interview 1 - Pricing & Onboarding",
+            "participant_name": "Alice",
+            "segment": "SMB",
+            "role": "CEO",
+            "notes": "Struggled with initial setup.",
+            "text": "Interviewer: How was your onboarding experience?\n\nCustomer: It was okay, but the pricing tiers were really confusing. I didn't know if I needed the Pro or Enterprise plan.\n\nInterviewer: What would make it better?\n\nCustomer: A clear comparison chart. Also, the invite system for my team was buggy. I had to resend invites three times."
+        },
+        {
+            "name": "Interview 2 - Mobile App Sync",
+            "participant_name": "Bob",
+            "segment": "Enterprise",
+            "role": "Field Sales",
+            "notes": "Uses the app mostly on the go.",
+            "text": "Interviewer: You mentioned using the mobile app heavily. How is that going?\n\nCustomer: The mobile app is fast, but the offline sync is a nightmare. I lose data when I'm in an elevator or subway.\n\nInterviewer: How about notifications?\n\nCustomer: Way too many. I get pinged for every little update. I need a daily digest option, otherwise it's just notification fatigue."
+        },
+        {
+            "name": "Interview 3 - API & Integrations",
+            "participant_name": "Charlie",
+            "segment": "Mid-Market",
+            "role": "Data Analyst",
+            "notes": "Power user, wants API access.",
+            "text": "Interviewer: What's the biggest missing feature for you right now?\n\nCustomer: Integrations, hands down. We use Slack and Jira, and right now I have to manually copy-paste data between them and your tool.\n\nInterviewer: Are you looking for a native integration or an API?\n\nCustomer: Native Jira sync would save me 5 hours a week. An open API would be a nice bonus for our engineering team."
+        }
+    ]
+
+    st.session_state.project_entries = []
+    st.session_state.all_chunks = []
+    
+    for entry in demo_interviews:
+        chunks = chunk_transcript(entry["text"])
+        st.session_state.all_chunks.extend(chunks)
+        st.session_state.project_entries.append(entry)
+        
+    st.session_state.search_results = None
+    st.session_state.assistant_answer = None
+    st.session_state.evidence_insight = None
+    st.session_state.aggregate_insights = None
+    st.session_state.evaluation_data = None
+    
+    # Populate the intake form with the first interview so users can see what it looks like
+    first = demo_interviews[0]
+    st.session_state.pending_transcript = first["text"]
+    st.session_state.pending_name = first["name"] + " (Draft Copy)"
+    st.session_state.pending_participant_name = first["participant_name"]
+    st.session_state.pending_segment = first["segment"]
+    st.session_state.pending_role = first["role"]
+    st.session_state.pending_notes = first["notes"]
+
+    refresh_collection(st.session_state.last_embedding_backend or "local")
+
+
 def _clear_intake_form():
     st.session_state.pending_transcript = ""
     st.session_state.pending_name = ""
@@ -320,30 +387,88 @@ def _clear_intake_form():
     st.session_state.pending_notes = ""
 
 
+def highlight_keywords(text: str, query: str) -> str:
+    """Helper to safely highlight query terms in text using HTML <mark> tags."""
+    if not text:
+        return ""
+    escaped_text = html.escape(text)
+    if not query:
+        return escaped_text
+    
+    # Extract words longer than 2 characters from the query
+    words = [w for w in re.split(r'\W+', query) if len(w) > 2]
+    if not words:
+        return escaped_text
+        
+    # Create a regex pattern to match any of the words (case-insensitive)
+    pattern = re.compile(rf"\b({'|'.join(map(re.escape, words))})\b", re.IGNORECASE)
+    return pattern.sub(r'<mark style="background: #fef08a; color: #1e293b; padding: 0 2px; border-radius: 2px;">\1</mark>', escaped_text)
+
+
 with tabs[1]:
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("## 01 · Interview ingestion")
 
     upload_file = st.file_uploader(
-        "Upload a transcript (.txt or .md)",
-        type=["txt", "md"],
-        help="Upload interview transcripts or meeting notes for semantic search and insight generation.",
+        "Upload a transcript (.txt, .md) or audio (.mp3, .wav, .m4a, .flac)",
+        type=["txt", "md", "mp3", "wav", "m4a", "flac"],
+        help="Upload text transcripts or raw audio files. Audio is transcribed via Whisper API.",
     )
 
-    st.button("Load sample transcript", type="secondary", on_click=_set_sample_transcript)
+    whisper_prompt = st.text_input(
+        "Audio transcription prompt (optional)",
+        placeholder="e.g. product names, acronyms, or industry jargon like: ChromaDB, LLM, Streamlit",
+        help="Whisper uses this context to correctly spell specific terms during transcription.",
+    )
+    
+    st.markdown("🎧 *Don't have an audio file? Right click and save this [jfk.flac](https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac) (OpenAI official test audio) to try Whisper.*")
+
+    if st.button("🚀 Load full demo project (3 interviews)", type="secondary", help="Instantly populates the system with 3 realistic interviews to test cross-session insights."):
+        with st.spinner("Building demo project..."):
+            _load_demo_project()
+            st.success("✅ Demo project loaded! Head over to the **Research** or **Insights** tabs to explore.")
 
     if upload_file is not None:
-        try:
-            text = load_transcript(text=upload_file.read().decode("utf-8"))
-            st.session_state.pending_transcript = text
-        except Exception as exc:
-            st.error(f"Could not read upload: {exc}")
+        # Ensure we only read the file once when it's uploaded/changed
+        if st.session_state.get("last_uploaded_file_id") != upload_file.file_id:
+            try:
+                file_ext = upload_file.name.split('.')[-1].lower()
+                
+                if file_ext in ['mp3', 'wav', 'm4a', 'flac']:
+                    with st.spinner("🎧 Transcribing audio with Whisper API... This might take a minute."):
+                        from src.ingestion import transcribe_audio
+                        text = transcribe_audio(upload_file.getvalue(), upload_file.name, prompt=whisper_prompt)
+                    
+                    if llm_ready:
+                        with st.spinner("🤖 Identifying speakers and formatting dialogue..."):
+                            from src.insights import format_transcript_dialogue
+                            text = format_transcript_dialogue(text, backend=llm_backend)
+                else:
+                    text = load_transcript(text=upload_file.getvalue().decode("utf-8"))
+                
+                st.session_state.pending_transcript = text
+                st.session_state.last_uploaded_file_id = upload_file.file_id
+            except Exception as exc:
+                st.error(f"Could not read upload: {exc}")
 
-    st.text_area(
-        "Transcript preview",
-        key="pending_transcript",
-        height=240,
-    )
+    # Optimize rendering for very long transcripts
+    current_transcript = st.session_state.pending_transcript
+    if len(current_transcript) > 10000:
+        st.info("Transcript is too long to display fully. Preview is truncated to maintain UI performance.")
+        st.text_area(
+            "Transcript preview (View Only)",
+            value=current_transcript[:10000] + "\n\n... [Content truncated for preview. Full text will be processed.]",
+            height=240,
+            disabled=True,
+        )
+    else:
+        updated_transcript = st.text_area(
+            "Transcript preview",
+            value=current_transcript,
+            height=240,
+        )
+        if updated_transcript != current_transcript:
+            st.session_state.pending_transcript = updated_transcript
 
     st.text_input("Interview name", key="pending_name")
     st.text_input("Participant name", key="pending_participant_name")
@@ -358,38 +483,42 @@ with tabs[1]:
         if not st.session_state.pending_transcript.strip():
             st.error("Please upload or paste a transcript before adding it to the project.")
         else:
-            try:
-                chunks = chunk_transcript(st.session_state.pending_transcript)
-                st.session_state.all_chunks.extend(chunks)
-                st.session_state.project_entries.append(
-                    {
-                        "name": st.session_state.pending_name or f"Interview {interview_count + 1}",
-                        "participant_name": st.session_state.pending_participant_name,
-                        "segment": st.session_state.pending_segment,
-                        "role": st.session_state.pending_role,
-                        "notes": st.session_state.pending_notes,
-                        "text": st.session_state.pending_transcript,
-                    }
-                )
-                st.session_state.search_results = None
-                st.session_state.assistant_answer = None
-                st.session_state.evidence_insight = None
-                st.session_state.aggregate_insights = None
-                st.session_state.evaluation_data = None
-                if embedding_backend == "openai" and not openai_key:
-                    st.warning("OpenAI key is missing — cannot build OpenAI embeddings. Switch to local backend or add OPENAI_API_KEY.")
-                else:
-                    refresh_collection(embedding_backend)
-                st.success("Interview added to the project and indexed for search.")
-            except Exception as exc:
-                st.error(f"Failed to add interview: {exc}")
+            with st.spinner("Processing text, computing embeddings, and updating index..."):
+                try:
+                    chunks = chunk_transcript(st.session_state.pending_transcript)
+                    st.session_state.all_chunks.extend(chunks)
+                    st.session_state.project_entries.append(
+                        {
+                            "name": st.session_state.pending_name or f"Interview {interview_count + 1}",
+                            "participant_name": st.session_state.pending_participant_name,
+                            "segment": st.session_state.pending_segment,
+                            "role": st.session_state.pending_role,
+                            "notes": st.session_state.pending_notes,
+                            "text": st.session_state.pending_transcript,
+                        }
+                    )
+                    st.session_state.search_results = None
+                    st.session_state.assistant_answer = None
+                    st.session_state.evidence_insight = None
+                    st.session_state.aggregate_insights = None
+                    st.session_state.evaluation_data = None
+                    if embedding_backend == "openai" and not openai_key:
+                        st.warning("OpenAI key is missing — cannot build OpenAI embeddings. Switch to local backend or add OPENAI_API_KEY.")
+                    else:
+                        refresh_collection(embedding_backend)
+                    st.success("Interview added to the project and indexed for search.")
+                    _clear_intake_form()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to add interview: {exc}")
 
     if st.session_state.project_entries:
         st.markdown("### Project interviews")
-        for entry in st.session_state.project_entries:
-            st.markdown(
-                f"- **{entry['name']}** ({entry.get('segment', 'Unspecified')} / {entry.get('role', 'Unspecified')})"
-            )
+        for i, entry in enumerate(st.session_state.project_entries):
+            with st.expander(f"📄 **{entry['name']}** ({entry.get('segment', 'Unspecified')} / {entry.get('role', 'Unspecified')})"):
+                st.markdown(f"**Participant:** {entry.get('participant_name', 'N/A')} &nbsp; | &nbsp; **Notes:** {entry.get('notes', 'None')}")
+                st.markdown("**Transcript:**")
+                st.text_area("Transcript content", value=entry["text"], height=150, disabled=True, label_visibility="collapsed", key=f"proj_entry_{i}")
     else:
         st.info("No interviews added yet. Use the uploader above to begin.")
 
@@ -407,6 +536,10 @@ with tabs[3]:
                 "Local embedding search is available, but research assistant and evidence-backed insight generation "
                 "require an OpenAI or Gemini API key. Set one in .env and restart the app to enable those features."
             )
+            
+        with st.expander("⚙️ Advanced search settings", expanded=False):
+            use_expansion = st.checkbox("🧠 Enable AI Query Expansion (Higher Recall)", value=False, disabled=not llm_ready, help="Uses LLM to rewrite your query into multiple variants.")
+            use_rerank = st.checkbox("🎯 Enable Cross-Encoder Reranking (Higher Precision)", value=False, help="Uses a local ms-marco model to accurately re-score search results.")
 
         query_col, btn_col = st.columns([4, 1])
 
@@ -437,10 +570,18 @@ with tabs[3]:
         if search_clicked and query:
             with st.spinner(f"Searching for '{query}'…"):
                 try:
+                    search_queries = query
+                    if use_expansion and llm_ready:
+                        from src.insights import expand_research_query
+                        with st.spinner("Expanding query using LLM..."):
+                            search_queries = expand_research_query(query, backend=llm_backend)
+                            st.caption(f"**Expanded search:** {', '.join(search_queries)}")
+
                     hits = semantic_search(
-                        query,
+                        search_queries,
                         st.session_state.collection,
                         n_results=n_results,
+                        rerank=use_rerank,
                     )
                     quotes = extract_quotes_from_hits(hits)
                     st.session_state.search_results = {
@@ -462,8 +603,9 @@ with tabs[3]:
                 quotes = results["quotes"]
                 if quotes:
                     for q in quotes:
+                        highlighted_q = highlight_keywords(q, results["query"])
                         st.markdown(
-                            f'<div class="quote-card"><div class="quote-text">"{q}"</div></div>',
+                            f'<div class="quote-card"><div class="quote-text">"{highlighted_q}"</div></div>',
                             unsafe_allow_html=True,
                         )
                 else:
@@ -472,7 +614,11 @@ with tabs[3]:
             with tab2:
                 for hit in results["hits"]:
                     with st.expander(f"Chunk {hit['id']} · relevance {hit['score']:.3f}"):
-                        st.text(hit["text"])
+                        highlighted_chunk = highlight_keywords(hit["text"], results["query"])
+                        st.markdown(
+                            f'<div style="white-space: pre-wrap; font-size: 0.9rem;">{highlighted_chunk}</div>',
+                            unsafe_allow_html=True
+                        )
 
             if results["quotes"]:
                 if not llm_ready:

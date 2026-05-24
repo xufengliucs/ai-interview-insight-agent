@@ -179,3 +179,20 @@ Original query: {query}
 Generate 3 alternative phrasings of this query that might surface different but relevant passages.
 Return ONLY a JSON array of strings. Example: ["phrase 1", "phrase 2", "phrase 3"]
 """
+
+
+DIARIZE_PROMPT = """You are an expert audio transcription editor.
+I am providing you with a raw transcript from a customer interview that currently lacks speaker labels.
+
+Your task is to reconstruct the dialogue by logically inferring the speakers and adding "Interviewer:" and "Customer:" labels.
+
+Rules:
+- Maintain the exact original words. Do not summarize or paraphrase.
+- Add "Interviewer:" for the person asking questions and driving the conversation.
+- Add "Customer:" for the person answering and sharing their experience.
+- Add a blank line between different speaker turns.
+- Return ONLY the formatted transcript text. No preamble, no markdown code blocks.
+
+RAW TRANSCRIPT:
+{transcript}
+"""

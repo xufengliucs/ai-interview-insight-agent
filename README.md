@@ -22,11 +22,12 @@ This project explores how AI systems can accelerate that workflow: surface recur
 
 | Feature | Description |
 |---|---|
-| **Upload transcript** | Supports `.txt` and `.md` files with or without speaker labels |
-| **Semantic search** | Retrieve relevant quotes using embedding-based vector search |
+| **Multimodal Ingestion** | Supports text transcripts and raw audio (`.mp3`, `.wav`) transcribed via Whisper API |
+| **Speaker Diarization** | Auto-infer and format speaker turns from unstructured text using LLM logic |
+| **Advanced RAG Search** | High-recall AI query expansion + high-precision Cross-Encoder reranking |
+| **Persistent Storage** | Local SQLite-backed ChromaDB for instant restarts without re-embedding |
 | **Multi-interview analysis** | Aggregate themes and trends across multiple sessions |
 | **Research dashboard** | Track project health, interview metadata coverage, and workflow progress |
-| **Participant metadata** | Track interview segment, role, and screener notes across your research project |
 | **Evidence-backed insights** | Synthesize a focused insight card from a topic + supporting quotes |
 | **Evaluation** | LLM-as-judge scoring for groundedness, specificity, and actionability |
 

@@ -7,9 +7,10 @@ Transcripts are split into semantically meaningful segments before embedding.
 
 import re
 import logging
+import uuid
 from pathlib import Path
+from src.constants import SPEAKER_PATTERN, TURN_PATTERN
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -64,28 +65,25 @@ def chunk_transcript(
     Returns:
         List of dicts with keys: 'id', 'text', 'word_count'.
     """
-    # Detect speaker-turn structure
-    speaker_pattern = re.compile(
-        r"^(Interviewer|Customer|Participant|Researcher|Host|Guest)\s*:", 
-        re.MULTILINE | re.IGNORECASE
-    )
-
-    if speaker_pattern.search(transcript):
+    # Detect speaker-turn structure using shared regex
+    if SPEAKER_PATTERN.search(transcript):
         logger.info("Speaker labels detected — chunking by turn.")
         raw_chunks = _split_by_speaker_turns(transcript, chunk_size)
     else:
         logger.info("No speaker labels — falling back to word-count chunking.")
         raw_chunks = _split_by_word_count(transcript, chunk_size, overlap)
 
-    chunks = [
-        {
-            "id": f"chunk_{i:03d}",
-            "text": chunk.strip(),
-            "word_count": len(chunk.split()),
-        }
-        for i, chunk in enumerate(raw_chunks)
-        if chunk.strip()
-    ]
+    chunks = []
+    for chunk in raw_chunks:
+        chunk_text = chunk.strip()
+        if chunk_text:
+            # Generate a globally unique ID for the chunk to prevent ChromaDB collisions
+            chunk_id = uuid.uuid4().hex[:12]
+            chunks.append({
+                "id": f"chunk_{chunk_id}",
+                "text": chunk_text,
+                "word_count": len(chunk_text.split()),
+            })
 
     logger.info(f"Created {len(chunks)} chunks from transcript.")
     return chunks
@@ -96,12 +94,8 @@ def _split_by_speaker_turns(transcript: str, chunk_size: int) -> list[str]:
     Split on speaker labels and group adjacent turns into chunks
     that stay near chunk_size words.
     """
-    # Split into individual turns
-    turn_pattern = re.compile(
-        r"(?=(?:Interviewer|Customer|Participant|Researcher|Host|Guest)\s*:)",
-        re.IGNORECASE,
-    )
-    turns = [t.strip() for t in turn_pattern.split(transcript) if t.strip()]
+    # Split into individual turns using shared regex
+    turns = [t.strip() for t in TURN_PATTERN.split(transcript) if t.strip()]
 
     chunks: list[str] = []
     current: list[str] = []
@@ -126,6 +120,9 @@ def _split_by_word_count(
     transcript: str, chunk_size: int, overlap: int
 ) -> list[str]:
     """Split plain text by word count with overlap."""
+    if chunk_size <= overlap:
+        raise ValueError("chunk_size must be strictly greater than overlap to prevent infinite loops.")
+
     words = transcript.split()
     chunks: list[str] = []
     start = 0
@@ -141,3 +138,34 @@ def _split_by_word_count(
 def get_full_text(chunks: list[dict]) -> str:
     """Reconstruct full text from a list of chunk dicts."""
     return "\n\n".join(c["text"] for c in chunks)
+
+
+def transcribe_audio(audio_bytes: bytes, file_name: str, prompt: str | None = None) -> str:
+    """
+    Transcribe an audio file using OpenAI's Whisper API.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError("openai package not installed. Run: pip install openai")
+
+    import os
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("OPENAI_API_KEY not set in environment. Cannot transcribe audio.")
+
+    client = OpenAI(api_key=api_key)
+
+    # OpenAI requires a file-like object with a valid filename extension
+    import io
+    file_obj = io.BytesIO(audio_bytes)
+    file_obj.name = file_name
+
+    logger.info(f"Transcribing audio file: {file_name} with Whisper API.")
+    
+    kwargs = {"model": "whisper-1", "file": file_obj}
+    if prompt and prompt.strip():
+        kwargs["prompt"] = prompt.strip()
+        
+    response = client.audio.transcriptions.create(**kwargs)
+    return response.text

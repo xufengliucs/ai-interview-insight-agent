@@ -30,24 +30,24 @@ Score each dimension from 1-5 and provide a brief justification.
 Return ONLY a valid JSON object:
 {{
   "groundedness": {{
-    "score": <1-5>,
+    "score": 5,
     "justification": "Is each insight traceable to something said in the transcript?"
   }},
   "specificity": {{
-    "score": <1-5>,
+    "score": 4,
     "justification": "Are insights specific to this customer, or generic platitudes?"
   }},
   "actionability": {{
-    "score": <1-5>,
+    "score": 3,
     "justification": "Do recommendations clearly suggest what a product team should do?"
   }},
   "coverage": {{
-    "score": <1-5>,
+    "score": 5,
     "justification": "Did the insights capture the most important things from the interview?"
   }},
-  "overall_score": <average of the four scores, one decimal>,
   "summary": "One sentence overall assessment."
 }}
+Note: All scores MUST be integers between 1 and 5.
 """
 
 
@@ -69,7 +69,7 @@ def evaluate_insights(
     Returns:
         Evaluation dict with scores and justifications.
     """
-    from src.insights import _call_llm
+    from src.insights import _call_llm, _attempt_fix_json
 
     insights_str = json.dumps(insights, indent=2)
     prompt = EVALUATION_PROMPT.format(
@@ -82,10 +82,21 @@ def evaluate_insights(
     cleaned = _clean_json(raw)
 
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"Evaluation parse error: {e}")
-        return {"error": str(e), "raw": raw}
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            parsed = json.loads(fixed)
+        except json.JSONDecodeError:
+            logger.error(f"Evaluation parse error: {e}\nRaw: {raw}")
+            return {"error": str(e), "raw": raw}
+
+    # Safely compute overall_score in Python rather than relying on LLM math
+    scores = [v.get("score") for k, v in parsed.items() if isinstance(v, dict) and "score" in v]
+    valid_scores = [s for s in scores if isinstance(s, (int, float))]
+    parsed["overall_score"] = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
+
+    return parsed
 
 
 def score_retrieval_hits(
@@ -108,7 +119,7 @@ def score_retrieval_hits(
     Returns:
         Dict with per-hit relevance scores and an average precision score.
     """
-    from src.insights import _call_llm
+    from src.insights import _call_llm, _attempt_fix_json
 
     hits_str = "\n\n".join(
         f"[Chunk {i+1} | score={h['score']}]\n{h['text']}"
@@ -126,8 +137,7 @@ For each chunk, rate its relevance to the query: 0 (irrelevant), 1 (partially re
 
 Return ONLY a JSON object:
 {{
-  "chunk_scores": [0, 1, 2, ...],
-  "average_precision": <float 0-1>,
+  "chunk_scores": [2, 0, 1],
   "notes": "Brief comment on retrieval quality."
 }}"""
 
@@ -135,14 +145,26 @@ Return ONLY a JSON object:
     cleaned = _clean_json(raw)
 
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        return {"error": "Parse failed", "raw": raw}
+        fixed = _attempt_fix_json(cleaned)
+        try:
+            parsed = json.loads(fixed)
+        except json.JSONDecodeError:
+            return {"error": "Parse failed", "raw": raw}
+            
+    # Compute average precision in Python
+    scores = parsed.get("chunk_scores", [])
+    if scores and all(isinstance(s, (int, float)) for s in scores):
+        parsed["average_precision"] = round(sum(scores) / (len(scores) * 2), 2) # max score is 2
+        
+    return parsed
 
 
 def _clean_json(raw: str) -> str:
-    """Strip markdown fences from LLM response."""
+    """Extract JSON block even if hidden inside markdown with conversational text."""
     raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL)
+    if match:
+        return match.group(1).strip()
     return raw.strip()
