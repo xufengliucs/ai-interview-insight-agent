@@ -184,7 +184,7 @@ class TestRetrievalHelpers:
             }
         ]
         quotes = extract_quotes_from_hits(hits, min_score=0.3)
-        assert any("subscription" in q for q in quotes)
+        assert any("subscription" in q["text"] for q in quotes)
 
     def test_extract_quotes_filters_low_score(self):
         from src.retrieval import extract_quotes_from_hits
@@ -206,7 +206,7 @@ class TestRetrievalHelpers:
             {"id": "chunk_001", "text": repeated_text, "score": 0.85},
         ]
         quotes = extract_quotes_from_hits(hits, min_score=0.3)
-        assert len(quotes) == len(set(quotes))
+        assert len(quotes) == 1
 
 
 if __name__ == "__main__":

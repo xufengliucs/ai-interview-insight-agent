@@ -158,7 +158,14 @@ def build_index(
 
     documents = [c["text"] for c in chunks]
     ids = [c["id"] for c in chunks]
-    metadatas = [{"word_count": c["word_count"]} for c in chunks]
+    metadatas = [
+        {
+            "word_count": c.get("word_count", 0),
+            "interview_name": c.get("interview_name", "Unknown"),
+            "participant_name": c.get("participant_name", "Unknown"),
+        }
+        for c in chunks
+    ]
 
     _collection.add(documents=documents, ids=ids, metadatas=metadatas)
     _current_collection_name = collection_name
@@ -206,8 +213,8 @@ def semantic_search(
 
     # Flatten and deduplicate results across all expanded queries
     unique_hits = {}
-    for doc_list, dist_list, id_list in zip(results["documents"], results["distances"], results["ids"]):
-        for doc, dist, chunk_id in zip(doc_list, dist_list, id_list):
+    for doc_list, dist_list, id_list, meta_list in zip(results["documents"], results["distances"], results["ids"], results["metadatas"]):
+        for doc, dist, chunk_id, meta in zip(doc_list, dist_list, id_list, meta_list):
             score = round(1 - dist, 4)
             # Keep the highest score if a chunk was found by multiple query variants
             if chunk_id not in unique_hits or unique_hits[chunk_id]["score"] < score:
@@ -215,6 +222,7 @@ def semantic_search(
                     "id": chunk_id,
                     "text": doc,
                     "score": score,
+                    "metadata": meta,
                 }
 
     hits_list = list(unique_hits.values())
@@ -242,7 +250,7 @@ def semantic_search(
     return sorted_hits[:final_n]
 
 
-def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[str]:
+def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[dict]:
     """
     Extract customer-only quotes from search results.
     Filters out interviewer lines and low-relevance chunks.
@@ -254,6 +262,10 @@ def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[s
     for hit in hits:
         if hit["score"] < min_score:
             continue
+            
+        meta = hit.get("metadata", {})
+        source = f"{meta.get('interview_name', 'Unknown')} ({meta.get('participant_name', 'Unknown')})"
+        
         # Extract customer lines specifically
         lines = hit["text"].split("\n")
         capturing = False
@@ -263,18 +275,18 @@ def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[s
                 # Strip the speaker prefix (everything up to the first colon)
                 text = re.sub(r"^[^:]+:\s*", "", line).strip()
                 if text:
-                    quotes.append(text)
+                    quotes.append({"text": text, "source": source})
             elif INTERVIEWER_PATTERN.match(line):
                 capturing = False
             elif capturing and line.strip():
-                quotes.append(line.strip())
+                quotes.append({"text": line.strip(), "source": source})
 
     # Deduplicate while preserving order
     seen = set()
     unique = []
     for q in quotes:
-        if q not in seen and len(q) > 20:
-            seen.add(q)
+        if q["text"] not in seen and len(q["text"]) > 20:
+            seen.add(q["text"])
             unique.append(q)
 
     return unique

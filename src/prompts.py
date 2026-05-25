@@ -153,9 +153,12 @@ INTERVIEWS:
 
 RESEARCH_ASSISTANT_PROMPT = """You are a research assistant helping a product team interpret customer interview evidence.
 
-Question: {query}
+CONVERSATION HISTORY:
+{chat_history}
 
-Relevant supporting quotes from the transcripts:
+CURRENT QUESTION: {query}
+
+RELEVANT SUPPORTING QUOTES:
 {quotes}
 
 Return ONLY a valid JSON object with this structure:
@@ -167,7 +170,7 @@ Return ONLY a valid JSON object with this structure:
 
 Rules:
 - Return ONLY JSON, no markdown fences or extra explanation.
-- Base your answer on the evidence provided.
+- Base your answer on the evidence provided and the conversation history.
 - If the evidence is weak, be transparent and suggest how to verify.
 """
 

@@ -20,7 +20,7 @@ def _clean_json_response(raw: str) -> str:
     """Extract JSON block even if hidden inside markdown with conversational text."""
     raw = raw.strip()
     # Look for a markdown code block anywhere in the text
-    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL)
+    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return raw.strip()
@@ -102,7 +102,9 @@ def _attempt_fix_json(cleaned: str) -> str:
     if in_string:
         fixed += '"'
 
+    # Strip trailing commas safely if we are about to forcibly close the structure
     if stack:
+        fixed = fixed.rstrip(" \n\r\t,")
         while stack:
             opener = stack.pop()
             fixed += '}' if opener == '{' else ']'
@@ -238,15 +240,17 @@ def extract_aggregate_insights(
 def answer_research_query(
     query: str,
     quotes: list[str],
+    chat_history: list[dict] | None = None,
     backend: LLMBackend = "openai",
     model: str | None = None,
 ) -> dict:
     """
-    Answer a research question using retrieved evidence quotes.
+    Answer a research question using retrieved evidence quotes and chat history.
 
     Args:
         query: Natural language research question.
         quotes: Supporting quote list.
+        chat_history: List of previous chat messages.
         backend: "openai" or "gemini".
         model: Optional model override.
 
@@ -255,8 +259,18 @@ def answer_research_query(
     """
     from src.prompts import RESEARCH_ASSISTANT_PROMPT
 
+    history_str = "No prior conversation."
+    if chat_history:
+        history_str = ""
+        for msg in chat_history:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_str += f"{role}: {msg['content']}\n\n"
+        history_str = history_str.strip()
+
     quotes_str = "\n".join(f'- "{q}"' for q in quotes)
-    prompt = RESEARCH_ASSISTANT_PROMPT.format(query=query, quotes=quotes_str)
+    prompt = RESEARCH_ASSISTANT_PROMPT.format(
+        query=query, quotes=quotes_str, chat_history=history_str
+    )
     logger.info(f"Answering research question: '{query}'")
 
     raw = _call_llm(prompt, backend=backend, model=model)

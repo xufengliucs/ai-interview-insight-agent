@@ -174,6 +174,31 @@ st.markdown("""
 
 # ── App state management ─────────────────────────────────────────────────────
 
+def load_app_state():
+    state_file = Path(__file__).parent / "chroma_db" / "app_state.json"
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load app state: {e}")
+    return None
+
+
+def save_app_state():
+    state_file = Path(__file__).parent / "chroma_db" / "app_state.json"
+    state_file.parent.mkdir(exist_ok=True)
+    state = {
+        "project_entries": st.session_state.project_entries,
+        "all_chunks": st.session_state.all_chunks,
+        "research_chat": st.session_state.research_chat,
+        "aggregate_insights": st.session_state.aggregate_insights,
+        "evaluation_data": st.session_state.evaluation_data,
+    }
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
 def init_session_state():
     defaults = {
         "project_entries": [],
@@ -181,6 +206,7 @@ def init_session_state():
         "collection": None,
         "search_results": None,
         "assistant_answer": None,
+        "research_chat": [],
         "evidence_insight": None,
         "aggregate_insights": None,
         "evaluation_data": None,
@@ -193,11 +219,22 @@ def init_session_state():
         "pending_notes": "",
         "last_embedding_backend": None,
         "last_uploaded_file_id": None,
+        "_state_loaded": False,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    if not st.session_state._state_loaded:
+        saved_state = load_app_state()
+        if saved_state and saved_state.get("project_entries"):
+            st.session_state.project_entries = saved_state.get("project_entries", [])
+            st.session_state.all_chunks = saved_state.get("all_chunks", [])
+            st.session_state.research_chat = saved_state.get("research_chat", [])
+            st.session_state.aggregate_insights = saved_state.get("aggregate_insights", None)
+            st.session_state.evaluation_data = saved_state.get("evaluation_data", None)
+        st.session_state._state_loaded = True
 
 
 def load_sample_transcript() -> str:
@@ -379,10 +416,14 @@ def _load_demo_project():
     
     for entry in demo_interviews:
         chunks = chunk_transcript(entry["text"])
+        for c in chunks:
+            c["interview_name"] = entry["name"]
+            c["participant_name"] = entry["participant_name"]
         st.session_state.all_chunks.extend(chunks)
         st.session_state.project_entries.append(entry)
         
     st.session_state.search_results = None
+    st.session_state.research_chat = []
     st.session_state.assistant_answer = None
     st.session_state.evidence_insight = None
     st.session_state.aggregate_insights = None
@@ -398,6 +439,7 @@ def _load_demo_project():
     st.session_state.pending_notes = first["notes"]
 
     refresh_collection(st.session_state.last_embedding_backend or "local")
+    save_app_state()
     st.rerun()
 
 
@@ -510,11 +552,17 @@ with tabs[1]:
             with st.spinner("Processing text, computing embeddings, and updating index..."):
                 try:
                     chunks = chunk_transcript(st.session_state.pending_transcript)
+                    inv_name = st.session_state.pending_name or f"Interview {interview_count + 1}"
+                    part_name = st.session_state.pending_participant_name or "Unknown"
+                    for c in chunks:
+                        c["interview_name"] = inv_name
+                        c["participant_name"] = part_name
+                        
                     st.session_state.all_chunks.extend(chunks)
                     st.session_state.project_entries.append(
                         {
-                            "name": st.session_state.pending_name or f"Interview {interview_count + 1}",
-                            "participant_name": st.session_state.pending_participant_name,
+                            "name": inv_name,
+                            "participant_name": part_name,
                             "segment": st.session_state.pending_segment,
                             "role": st.session_state.pending_role,
                             "notes": st.session_state.pending_notes,
@@ -522,6 +570,7 @@ with tabs[1]:
                         }
                     )
                     st.session_state.search_results = None
+                    st.session_state.research_chat = []
                     st.session_state.assistant_answer = None
                     st.session_state.evidence_insight = None
                     st.session_state.aggregate_insights = None
@@ -532,6 +581,7 @@ with tabs[1]:
                         refresh_collection(embedding_backend)
                     st.success("Interview added to the project and indexed for search.")
                     _clear_intake_form()
+                    save_app_state()
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Failed to add interview: {exc}")
@@ -545,16 +595,24 @@ with tabs[1]:
                 st.text_area("Transcript content", value=entry["text"], height=150, disabled=True, label_visibility="collapsed", key=f"proj_entry_{i}")
                 
                 if st.button("🗑️ Remove this interview", key=f"remove_entry_{i}"):
-                    st.session_state.project_entries.pop(i)
-                    st.session_state.all_chunks = []
-                    for remaining_entry in st.session_state.project_entries:
-                        st.session_state.all_chunks.extend(chunk_transcript(remaining_entry["text"]))
-                    st.session_state.search_results = None
-                    st.session_state.aggregate_insights = None
-                    st.session_state.evaluation_data = None
-                    with st.spinner("Rebuilding index..."):
-                        refresh_collection(st.session_state.last_embedding_backend or "local")
-                    st.rerun()
+                    st.session_state.pending_remove_index = i
+
+        # Handle the removal safely outside of the rendering loop
+        if st.session_state.get("pending_remove_index") is not None:
+            remove_idx = st.session_state.pop("pending_remove_index")
+            if 0 <= remove_idx < len(st.session_state.project_entries):
+                st.session_state.project_entries.pop(remove_idx)
+                st.session_state.all_chunks = []
+                for remaining_entry in st.session_state.project_entries:
+                    st.session_state.all_chunks.extend(chunk_transcript(remaining_entry["text"]))
+                st.session_state.search_results = None
+                st.session_state.research_chat = []
+                st.session_state.aggregate_insights = None
+                st.session_state.evaluation_data = None
+                with st.spinner("Rebuilding index..."):
+                    refresh_collection(st.session_state.last_embedding_backend or "local")
+                save_app_state()
+                st.rerun()
     else:
         st.info("No interviews added yet. Use the uploader above to begin.")
 
@@ -625,6 +683,7 @@ with tabs[3]:
                         "hits": hits,
                         "quotes": quotes,
                     }
+                    st.session_state.research_chat = []
                 except Exception as e:
                     st.error(f"Search failed: {e}")
                     logger.exception("Search error")
@@ -639,9 +698,11 @@ with tabs[3]:
                 quotes = results["quotes"]
                 if quotes:
                     for q in quotes:
-                        highlighted_q = highlight_keywords(q, results["query"])
+                        highlighted_q = highlight_keywords(q["text"], results["query"])
+                        source_label = html.escape(q.get("source", "Unknown"))
                         st.markdown(
-                            f'<div class="quote-card"><div class="quote-text">"{highlighted_q}"</div></div>',
+                            f'<div class="quote-card"><div class="quote-text">"{highlighted_q}"</div>'
+                            f'<div style="text-align: right; font-size: 0.8rem; color: #64748b; margin-top: 0.5rem;">— {source_label}</div></div>',
                             unsafe_allow_html=True,
                         )
                 else:
@@ -649,7 +710,9 @@ with tabs[3]:
 
             with tab2:
                 for hit in results["hits"]:
-                    with st.expander(f"Chunk {hit['id']} · relevance {hit['score']:.3f}"):
+                    meta = hit.get("metadata", {})
+                    source_label = f"{meta.get('interview_name', 'Unknown')} ({meta.get('participant_name', 'Unknown')})"
+                    with st.expander(f"Chunk {hit['id']} · relevance {hit['score']:.3f} · {source_label}"):
                         highlighted_chunk = highlight_keywords(hit["text"], results["query"])
                         st.markdown(
                             f'<div style="white-space: pre-wrap; font-size: 0.9rem;">{highlighted_chunk}</div>',
@@ -657,32 +720,95 @@ with tabs[3]:
                         )
 
             if results["quotes"]:
-                if not llm_ready:
-                    st.warning(
-                        "Research assistant requires an LLM key. Add OPENAI_API_KEY or GEMINI_API_KEY to use this feature."
-                    )
-                if st.button("🤖 Ask research assistant", type="secondary", disabled=not llm_ready):
-                    try:
-                        assistant = answer_research_query(
-                            results["query"],
-                            results["quotes"],
-                            backend=llm_backend,
-                        )
-                        st.session_state.assistant_answer = assistant
-                    except Exception as e:
-                        st.error(f"Research assistant failed: {e}")
-                        logger.exception("Research assistant error")
+                st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+                st.markdown("### 🤖 Chat with Research Assistant")
 
-            if st.session_state.assistant_answer:
-                research = st.session_state.assistant_answer
-                st.markdown("#### Research Assistant Answer")
-                st.markdown(f"**Answer:** {research.get('answer', '')}")
-                if research.get('supporting_quotes'):
-                    st.markdown("**Supporting quotes:**")
-                    for quote in research.get('supporting_quotes', []):
-                        st.markdown(f"- {quote}")
-                if research.get('recommended_next_steps'):
-                    st.markdown(f"**Recommended next step:** {research.get('recommended_next_steps')}")
+                if not llm_ready:
+                    st.warning("Research assistant requires an LLM key. Add OPENAI_API_KEY or GEMINI_API_KEY to use this feature.")
+                else:
+                    # Render existing chat
+                    for msg in st.session_state.research_chat:
+                        with st.chat_message(msg["role"]):
+                            st.markdown(msg["content"])
+                            if msg["role"] == "assistant" and msg.get("supporting_quotes"):
+                                with st.expander("Supporting quotes"):
+                                    for q in msg["supporting_quotes"]:
+                                        st.markdown(f"- {q}")
+
+                    if not st.session_state.research_chat:
+                        if st.button("Generate summary & start chat", type="primary"):
+                            with st.spinner("Analyzing results..."):
+                                try:
+                                    formatted_quotes = [f'{q["text"]} (Source: {q["source"]})' for q in results["quotes"]]
+                                    assistant = answer_research_query(
+                                        results["query"],
+                                        formatted_quotes,
+                                        chat_history=[],
+                                        backend=llm_backend,
+                                    )
+                                    ans_text = assistant.get('answer', '')
+                                    if assistant.get('recommended_next_steps'):
+                                        ans_text += f"\n\n**Recommended next step:** {assistant.get('recommended_next_steps')}"
+                                    
+                                    st.session_state.research_chat.append({
+                                        "role": "user",
+                                        "content": results["query"]
+                                    })
+                                    st.session_state.research_chat.append({
+                                        "role": "assistant",
+                                        "content": ans_text,
+                                        "supporting_quotes": assistant.get('supporting_quotes', [])
+                                    })
+                                    save_app_state()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Research assistant failed: {e}")
+                                    logger.exception("Research assistant error")
+
+                    if st.session_state.research_chat:
+                        with st.form("chat_input_form", clear_on_submit=True):
+                            chat_cols = st.columns([5, 1])
+                            follow_up = chat_cols[0].text_input(
+                                "Follow-up",
+                                label_visibility="collapsed",
+                                placeholder="Ask a follow-up question..."
+                            )
+                            submit_chat = chat_cols[1].form_submit_button("Send")
+
+                        if submit_chat and follow_up:
+                            st.session_state.research_chat.append({"role": "user", "content": follow_up})
+                            with st.chat_message("user"):
+                                st.markdown(follow_up)
+                            
+                            with st.chat_message("assistant"):
+                                with st.spinner("Thinking..."):
+                                    try:
+                                        formatted_quotes = [f'{q["text"]} (Source: {q["source"]})' for q in results["quotes"]]
+                                        assistant = answer_research_query(
+                                            follow_up,
+                                            formatted_quotes,
+                                            chat_history=st.session_state.research_chat[:-1],
+                                            backend=llm_backend,
+                                        )
+                                        ans_text = assistant.get('answer', '')
+                                        if assistant.get('recommended_next_steps'):
+                                            ans_text += f"\n\n**Recommended next step:** {assistant.get('recommended_next_steps')}"
+                                            
+                                        st.markdown(ans_text)
+                                        if assistant.get('supporting_quotes'):
+                                            with st.expander("Supporting quotes"):
+                                                for q in assistant['supporting_quotes']:
+                                                    st.markdown(f"- {q}")
+                                                    
+                                        st.session_state.research_chat.append({
+                                            "role": "assistant",
+                                            "content": ans_text,
+                                            "supporting_quotes": assistant.get('supporting_quotes', [])
+                                        })
+                                        save_app_state()
+                                    except Exception as e:
+                                        st.error(f"Research assistant failed: {e}")
+                                        st.session_state.research_chat.pop()
 
         # Evidence-backed insight generator
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
@@ -722,9 +848,10 @@ with tabs[3]:
                     if not quotes:
                         st.warning("No strong quotes found for this topic. Try rephrasing.")
                     else:
+                        formatted_quotes = [f'{q["text"]} (Source: {q["source"]})' for q in quotes[:4]]
                         insight = generate_evidence_insight(
                             topic=insight_topic,
-                            quotes=quotes[:4],
+                            quotes=formatted_quotes,
                             backend=llm_backend,
                         )
                         st.session_state.evidence_insight = insight
@@ -804,6 +931,7 @@ with tabs[2]:
                         backend=llm_backend,
                     )
                     st.session_state.aggregate_insights = data
+                    save_app_state()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Insight generation failed: {e}")
@@ -817,6 +945,7 @@ with tabs[2]:
                         st.session_state.aggregate_insights,
                         backend=llm_backend,
                     )
+                    save_app_state()
                 except Exception as e:
                     st.error(f"Evaluation failed: {e}")
                     logger.exception("Evaluation error")
@@ -958,7 +1087,28 @@ with tabs[2]:
 
             if st.session_state.evaluation_data:
                 with st.expander("🧠 Insight evaluation details", expanded=True):
-                    st.json(st.session_state.evaluation_data)
+                    eval_data = st.session_state.evaluation_data
+                    if "error" in eval_data:
+                        st.error(f"Evaluation error: {eval_data['error']}")
+                        st.json(eval_data)
+                    else:
+                        st.markdown(f"#### Overall Score: {eval_data.get('overall_score', 0)} / 5.0")
+                        st.markdown(f"*{eval_data.get('summary', '')}*")
+                        st.markdown("<br>", unsafe_allow_html=True)
+
+                        cols = st.columns(4)
+                        metrics = ["groundedness", "specificity", "actionability", "coverage"]
+
+                        for i, m in enumerate(metrics):
+                            if m in eval_data and isinstance(eval_data[m], dict):
+                                score = eval_data[m].get("score", 0)
+                                justification = eval_data[m].get("justification", "")
+                                with cols[i]:
+                                    st.metric(label=m.capitalize(), value=f"{score}/5")
+                                    # Ensure score stays within 0.0 to 1.0 range for the progress bar
+                                    safe_score = min(max(float(score) / 5.0, 0.0), 1.0)
+                                    st.progress(safe_score)
+                                    st.caption(justification)
 
 
 with tabs[4]:
@@ -967,8 +1117,8 @@ with tabs[4]:
     if not st.session_state.project_entries:
         st.markdown('<div class="empty-state">No project data available to export.</div>', unsafe_allow_html=True)
     else:
-            if not st.session_state.aggregate_insights:
-                st.info("💡 You have transcripts loaded, but haven't generated insights yet. Head over to the **Insights** tab to generate them before exporting your final report!")
+        if not st.session_state.aggregate_insights:
+            st.info("💡 You have transcripts loaded, but haven't generated insights yet. Head over to the **Insights** tab to generate them before exporting your final report!")
 
         export_package = {
             "project_entries": [

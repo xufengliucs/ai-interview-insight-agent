@@ -164,7 +164,7 @@ Return ONLY a JSON object:
 def _clean_json(raw: str) -> str:
     """Extract JSON block even if hidden inside markdown with conversational text."""
     raw = raw.strip()
-    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL)
+    match = re.search(r"```(?:json)?(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return raw.strip()
