@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.ingestion import (
     load_transcript,
     chunk_transcript,
+    chunks_from_interviews,
     _clean_text,
     _split_by_word_count,
     get_full_text,
@@ -119,12 +120,25 @@ class TestChunkTranscript:
             assert c["text"].strip() != ""
 
     def test_get_full_text_roundtrip(self):
-        chunks = chunk_transcript(PLAIN_TRANSCRIPT, chunk_size=50)
+        chunks = chunk_transcript(PLAIN_TRANSCRIPT, chunk_size=50, overlap=10)
         full = get_full_text(chunks)
         # All original words should appear somewhere in reconstructed text
         original_words = set(PLAIN_TRANSCRIPT.split())
         full_words = set(full.split())
         assert original_words.issubset(full_words)
+
+    def test_chunks_from_interviews_attaches_metadata(self):
+        entries = [
+            {
+                "name": "Interview A",
+                "participant_name": "Alex",
+                "text": SAMPLE_TRANSCRIPT,
+            }
+        ]
+        chunks = chunks_from_interviews(entries)
+        assert chunks
+        assert all(c["interview_name"] == "Interview A" for c in chunks)
+        assert all(c["participant_name"] == "Alex" for c in chunks)
 
 
 # ─── Prompts Tests ────────────────────────────────────────────────────────────
@@ -165,7 +179,8 @@ class TestPrompts:
         from src.prompts import RESEARCH_ASSISTANT_PROMPT
         formatted = RESEARCH_ASSISTANT_PROMPT.format(
             query="What is the main pain point?",
-            quotes='- "I hate syncing."'
+            quotes='- "I hate syncing."',
+            chat_history="No prior conversation.",
         )
         assert "What is the main pain point?" in formatted
         assert "I hate syncing." in formatted
@@ -207,6 +222,42 @@ class TestRetrievalHelpers:
         ]
         quotes = extract_quotes_from_hits(hits, min_score=0.3)
         assert len(quotes) == 1
+
+    def test_extract_quotes_uses_dense_score_when_reranked(self):
+        from src.retrieval import extract_quotes_from_hits
+        hits = [
+            {
+                "id": "chunk_000",
+                "text": "Customer: I hate subscription tracking because it never works right for me.",
+                "score": 0.75,
+                "dense_score": 0.75,
+                "rerank_score": -4.2,
+            }
+        ]
+        quotes = extract_quotes_from_hits(hits, min_score=0.3)
+        assert len(quotes) == 1
+
+        hits[0]["dense_score"] = 0.1
+        assert extract_quotes_from_hits(hits, min_score=0.3) == []
+
+    def test_relevance_score_prefers_dense_score(self):
+        from src.retrieval import relevance_score
+        hit = {"score": 0.9, "dense_score": 0.4, "rerank_score": 8.0}
+        assert relevance_score(hit) == 0.4
+
+    def test_install_model_loaders_override(self):
+        from src.retrieval import (
+            clear_model_loaders,
+            install_model_loaders,
+            _resolve_local_embedding_function,
+        )
+
+        sentinel = object()
+        install_model_loaders(local_embedding=lambda: sentinel)
+        try:
+            assert _resolve_local_embedding_function() is sentinel
+        finally:
+            clear_model_loaders()
 
 
 if __name__ == "__main__":

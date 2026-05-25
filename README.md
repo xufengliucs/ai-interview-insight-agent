@@ -25,7 +25,7 @@ This project explores how AI systems can accelerate that workflow: surface recur
 | **Multimodal Ingestion** | Supports text transcripts and raw audio (`.mp3`, `.wav`) transcribed via Whisper API |
 | **Speaker Diarization** | Auto-infer and format speaker turns from unstructured text using LLM logic |
 | **Advanced RAG Search** | High-recall AI query expansion + high-precision Cross-Encoder reranking |
-| **Persistent Storage** | Local SQLite-backed ChromaDB for instant restarts without re-embedding |
+| **Persistent Storage** | SQLite-backed ChromaDB + JSON project state under `chroma_db/` |
 | **Multi-interview analysis** | Aggregate themes and trends across multiple sessions |
 | **Research dashboard** | Track project health, interview metadata coverage, and workflow progress |
 | **Evidence-backed insights** | Synthesize a focused insight card from a topic + supporting quotes |
@@ -36,7 +36,7 @@ This project explores how AI systems can accelerate that workflow: surface recur
 ## Architecture
 
 ```
-transcript (.txt)
+transcript (.txt / audio)
      │
      ▼
 ┌──────────────┐     ┌────────────────────┐
@@ -54,20 +54,21 @@ transcript (.txt)
                              ▼
                     ┌────────────────────┐
                     │  ChromaDB          │
-                    │  (in-memory        │
-                    │   vector store)    │
+                    │  (persistent       │
+                    │   SQLite store)    │
                     └────────┬───────────┘
                              │
              ┌───────────────┴───────────────┐
              ▼                               ▼
    ┌──────────────────┐           ┌──────────────────┐
    │  semantic search │           │  LLM insight     │
-   │  (cosine sim.)   │           │  extraction      │
-   └──────────────────┘           │  (GPT / Gemini)  │
-             │                    └──────────────────┘
-             ▼                               │
-   retrieved quotes               themes, pain points,
-                                  recommendations, sentiment
+   │  (+ rerank opt.) │           │  extraction      │
+   └──────────────────┘           │  OpenAI / Gemini │
+             │                    │  / Ollama        │
+             ▼                    └──────────────────┘
+   retrieved quotes                      │
+                              themes, pain points,
+                              recommendations, sentiment
 ```
 
 ---
@@ -86,10 +87,10 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY or GEMINI_API_KEY if you have one.
+# Edit .env and add your OPENAI_API_KEY and/or GEMINI_API_KEY if you have one.
 ```
 
-> **No API key?** This app supports a free local embedding mode. Choose `Embedding backend = local` in the sidebar and you can still search transcripts and explore quotes without an OpenAI key.
+> **No API key?** Choose `Embedding backend = local` in the sidebar to search transcripts without an OpenAI key. For LLM features you can also use **Ollama** locally (no cloud key).
 
 ### 3. Run
 
@@ -115,13 +116,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-3. In the sidebar, set `Embedding backend` to `local` if you do not have an API key.
+3. In the sidebar, set `Embedding backend` to `local` if you do not have an OpenAI key.
 
-4. Go to the **Interviews** tab and click **Load sample transcript** or upload a `.txt` / `.md` transcript.
+4. Go to the **Interviews** tab and click **Load full demo project (3 interviews)** or upload a `.txt` / `.md` transcript.
 
 5. Use the **Research** tab to ask questions, scan for customer quotes, and generate evidence-backed answers.
 
-6. If you add `OPENAI_API_KEY` or `GEMINI_API_KEY`, switch the LLM backend to unlock full theme extraction, aggregate insights, and evaluation.
+6. For cloud LLMs, add `OPENAI_API_KEY` or `GEMINI_API_KEY` in `.env`. For a fully local LLM, run [Ollama](https://ollama.com/) and select `ollama` as the LLM backend.
 
 ---
 
@@ -129,20 +130,20 @@ streamlit run app.py
 
 - `local` embedding mode uses `sentence-transformers` and works without any API key.
 - Local embedding search is enough to explore transcripts, pull quotes, and test the interface.
-- The app caches the local embedding model during a Streamlit session so it does not reload on every interaction.
-- LLM-powered features like theme extraction, evidence insights, and evaluation still require an OpenAI or Gemini API key.
-- If you do have a key, put it in `.env`, restart Streamlit, and choose the desired LLM backend.
-- If you experience memory pressure, keep transcripts moderate in size and use local embedding mode for search-only exploration.
+- Heavy models are cached via Streamlit (`retrieval_streamlit.py`) so they do not reload on every interaction.
+- LLM-powered features need an API key **or** a local Ollama server (`ollama run llama3`).
+- Audio transcription (Whisper) requires `OPENAI_API_KEY` even when embeddings are local.
+- Project data is saved to `chroma_db/app_state.json` (interviews + insights). Chunks are rebuilt from transcripts on load — not duplicated on disk.
 
 ---
 
 ## Usage
 
-1. **Upload** one or more `.txt` transcripts (or click "Load sample transcript") and optionally fill in participant metadata
-2. **Review the dashboard** — check interview counts, segment distribution, metadata coverage, and workflow status
+1. **Upload** one or more transcripts (or click **Load full demo project**) and fill in participant metadata
+2. **Review the dashboard** — check interview counts, segment distribution, and workflow status
 3. **Search** across all interviews — type a query like `"pricing frustration"` to retrieve relevant quotes
-4. **Generate Insights** — click the button to extract cross-session themes, trends, and recommendations
-5. **Ask research assistant** — use evidence-backed quotes to answer a focused research question
+4. **Generate Insights** — extract cross-session themes, trends, and recommendations
+5. **Ask research assistant** — evidence-backed Q&A with safe Markdown rendering
 6. **Export** — download the structured insights and project package as JSON
 
 ---
@@ -151,23 +152,29 @@ streamlit run app.py
 
 ```
 ai-interview-insight-agent/
-├── app.py                  # Streamlit UI
+├── app.py                      # Streamlit UI
 ├── requirements.txt
 ├── .env.example
 ├── README.md
 │
 ├── src/
-│   ├── ingestion.py        # Transcript loading and chunking
-│   ├── retrieval.py        # Embeddings + ChromaDB vector search
-│   ├── insights.py         # LLM theme extraction and insight generation
-│   ├── prompts.py          # All prompt templates (centralized)
-│   └── evaluation.py       # LLM-as-judge quality scoring
+│   ├── ingestion.py            # Transcript loading and chunking
+│   ├── retrieval.py            # Embeddings + ChromaDB vector search
+│   ├── retrieval_streamlit.py  # Streamlit model cache (spinners)
+│   ├── insights.py             # LLM theme extraction and insight generation
+│   ├── prompts.py              # All prompt templates (centralized)
+│   ├── evaluation.py           # LLM-as-judge quality scoring
+│   └── constants.py            # Shared regex patterns
 │
 ├── tests/
-│   └── test_pipeline.py    # Unit tests (pytest)
+│   └── test_pipeline.py        # Unit tests (pytest)
 │
-└── sample_data/
-    └── sample_interview.txt
+├── sample_data/
+│   └── sample_interview.txt
+│
+└── chroma_db/                  # Created at runtime (gitignored)
+    ├── app_state.json          # Persisted project + insights
+    └── …                       # Chroma SQLite files
 ```
 
 ---
@@ -178,7 +185,7 @@ All settings are adjustable in the sidebar at runtime:
 
 | Setting | Options | Notes |
 |---|---|---|
-| LLM Backend | `openai`, `gemini` | Requires API key in `.env` |
+| LLM Backend | `openai`, `gemini`, `ollama` | Ollama uses `http://localhost:11434/v1` (no cloud key) |
 | Embedding Backend | `openai`, `local` | `local` = sentence-transformers, no key needed |
 | Search results | 2–10 | Number of chunks to retrieve per query |
 
@@ -198,11 +205,13 @@ Tests cover ingestion, chunking, prompts, and retrieval helpers — no API key r
 
 **Why Streamlit?** Fastest path to a working, shareable demo. A React frontend would add days of work with no user-facing benefit for a portfolio project.
 
-**Why ChromaDB?** Runs fully in-memory — no Docker, no server, no setup. Perfect for a demo that needs to just work.
+**Why ChromaDB (persistent)?** SQLite-backed storage under `chroma_db/` means restarts reuse embeddings when transcript content is unchanged. No Docker or separate vector DB server.
 
 **Why separate `prompts.py`?** Prompt iteration is the highest-leverage activity in LLM systems. Separating prompts from logic makes A/B testing one change at a time easy.
 
-**Why both OpenAI and local embeddings?** Lets the user run the full semantic search pipeline for free (sentence-transformers), while still offering the higher quality OpenAI embeddings when available.
+**Why both OpenAI and local embeddings?** Run semantic search for free with sentence-transformers, while still offering OpenAI embeddings when a key is available.
+
+**Why rebuild chunks on load?** Interview transcripts are the source of truth; chunk metadata is derived at startup so persisted state cannot drift.
 
 ---
 
@@ -210,9 +219,8 @@ Tests cover ingestion, chunking, prompts, and retrieval helpers — no API key r
 
 Some ideas if you want to go further:
 
-- **Multi-transcript analysis** — upload 5–10 interviews and cluster themes across them
-- **Persistent storage** — swap in-memory Chroma for a persisted collection
-- **Speaker diarization** — auto-detect speaker labels using Whisper
+- **Retrieval evaluation UI** — wire up `score_retrieval_hits()` in the Research tab
+- **Single-interview insights** — expose `extract_themes()` for one transcript in the UI
 - **Evaluation dashboard** — visualize insight quality scores over time
 - **Slack / Notion export** — push insights directly to your team's tools
 

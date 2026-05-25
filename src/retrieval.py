@@ -2,21 +2,26 @@
 retrieval.py
 ------------
 Handles embedding generation and semantic search over transcript chunks.
-Uses ChromaDB as the vector store (runs fully in-memory — no server needed).
+Uses ChromaDB as the vector store (persistent SQLite under chroma_db/).
 Supports OpenAI embeddings or a local sentence-transformers fallback.
 """
 
 import hashlib
 import logging
 import os
-import streamlit as st
+from collections.abc import Callable
+from functools import lru_cache
 from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
 EmbeddingBackend = Literal["openai", "local"]
 
-# Module-level cache so we don't re-initialize on every Streamlit re-run
+# Optional loaders (e.g. Streamlit cache_resource wrappers from retrieval_streamlit.py)
+_local_embedding_loader: Callable[[], Any] | None = None
+_cross_encoder_loader: Callable[[], Any] | None = None
+
+# Module-level cache so we don't re-initialize Chroma collections on every call
 _client: Any = None
 _collection: Any = None
 _current_collection_name: str | None = None
@@ -37,14 +42,60 @@ def _check_chromadb_available() -> tuple[Any, Any]:
     return chromadb, embedding_functions
 
 
-@st.cache_resource(show_spinner="Loading local embedding model...")
-def _get_local_embedding_function() -> Any:
-    """Load and cache the sentence-transformers model."""
+@lru_cache(maxsize=1)
+def _load_local_embedding_function() -> Any:
+    """Load and cache the sentence-transformers embedding function."""
     chromadb, embedding_functions = _check_chromadb_available()
     logger.info("Loading local sentence-transformers (all-MiniLM-L6-v2)...")
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"
     )
+
+
+@lru_cache(maxsize=1)
+def _load_cross_encoder() -> Any:
+    """Load and cache the CrossEncoder model for reranking."""
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as exc:
+        raise ImportError(
+            "sentence-transformers is required for reranking. "
+            "Install with `pip install sentence-transformers`."
+        ) from exc
+    logger.info("Loading CrossEncoder (ms-marco-MiniLM-L-6-v2) for reranking...")
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+def install_model_loaders(
+    *,
+    local_embedding: Callable[[], Any] | None = None,
+    cross_encoder: Callable[[], Any] | None = None,
+) -> None:
+    """Register optional model loaders (used by Streamlit UI for cached spinners)."""
+    global _local_embedding_loader, _cross_encoder_loader
+    if local_embedding is not None:
+        _local_embedding_loader = local_embedding
+    if cross_encoder is not None:
+        _cross_encoder_loader = cross_encoder
+
+
+def clear_model_loaders() -> None:
+    """Reset to built-in lru_cache loaders (useful in tests)."""
+    global _local_embedding_loader, _cross_encoder_loader
+    _local_embedding_loader = None
+    _cross_encoder_loader = None
+
+
+def _resolve_local_embedding_function() -> Any:
+    if _local_embedding_loader is not None:
+        return _local_embedding_loader()
+    return _load_local_embedding_function()
+
+
+def _resolve_cross_encoder() -> Any:
+    if _cross_encoder_loader is not None:
+        return _cross_encoder_loader()
+    return _load_cross_encoder()
 
 
 def _get_embedding_function(backend: EmbeddingBackend):
@@ -68,22 +119,27 @@ def _get_embedding_function(backend: EmbeddingBackend):
             api_key=api_key,
             model_name="text-embedding-3-small",
         )
-    else:
-        return _get_local_embedding_function()
+    return _resolve_local_embedding_function()
 
 
-@st.cache_resource(show_spinner="Loading CrossEncoder reranking model...")
-def _get_cross_encoder() -> Any:
-    """Load and cache the CrossEncoder model for reranking."""
-    try:
-        from sentence_transformers import CrossEncoder
-        logger.info("Loading CrossEncoder (ms-marco-MiniLM-L-6-v2) for reranking...")
-        return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    except ImportError as exc:
-        raise ImportError(
-            "sentence-transformers is required for reranking. "
-            "Install with `pip install sentence-transformers`."
-        ) from exc
+def relevance_score(hit: dict) -> float:
+    """
+    Cosine-similarity score for thresholding (0–1), even when results were reranked.
+
+    Prefer ``dense_score`` when present; otherwise use ``score``.
+    """
+    if "dense_score" in hit:
+        return float(hit["dense_score"])
+    return float(hit["score"])
+
+
+def format_hit_score(hit: dict) -> str:
+    """Human-readable score label for UI."""
+    if "rerank_score" in hit:
+        return (
+            f"rerank {hit['rerank_score']:.3f} · dense {relevance_score(hit):.3f}"
+        )
+    return f"{hit['score']:.3f}"
 
 
 def build_index(
@@ -92,7 +148,7 @@ def build_index(
     backend: EmbeddingBackend = "openai",
 ) -> Any:
     """
-    Embed transcript chunks and store them in a ChromaDB in-memory collection.
+    Embed transcript chunks and store them in a ChromaDB collection.
 
     Args:
         chunks: List of chunk dicts from ingestion.chunk_transcript().
@@ -126,13 +182,10 @@ def build_index(
     ef = _get_embedding_function(backend)
 
     if _client is None:
-        # Use an absolute path based on the project root to prevent stray directories
         db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "chroma_db")
         os.makedirs(db_path, exist_ok=True)
-        # Use a persistent client backed by SQLite on disk
         _client = chromadb.PersistentClient(path=db_path)
 
-    # Check if a persisted collection already exists with the exact same content
     try:
         _collection = _client.get_collection(name=collection_name, embedding_function=ef)
         if _collection.metadata and _collection.metadata.get("chunks_hash") == content_hash:
@@ -144,7 +197,6 @@ def build_index(
     except Exception:
         pass
 
-    # Drop old collection if it exists
     try:
         _client.delete_collection(collection_name)
     except Exception:
@@ -188,21 +240,22 @@ def semantic_search(
     Args:
         query: Natural language query string, or a list of expanded queries.
         collection: ChromaDB collection from build_index().
-        n_results: Number of top results to fetch per query.
-        rerank: If True, fetches more candidates and reranks them using a CrossEncoder.
+        n_results: Number of top results to return.
+        rerank: If True, fetches more candidates and reranks with a CrossEncoder.
 
     Returns:
-        List of result dicts with keys: 'text', 'score', 'id'.
+        List of result dicts with keys: id, text, score, metadata.
+        When reranked, also includes dense_score (cosine) and rerank_score (cross-encoder).
+        ``score`` stays as dense similarity for filtering; sort order uses rerank_score.
     """
     queries = [query] if isinstance(query, str) else query
-    logger.info(f"Searching for: {queries} (top {n_results} per query, rerank={rerank})")
+    logger.info(f"Searching for: {queries} (top {n_results}, rerank={rerank})")
 
     total_docs = collection.count()
     if total_docs == 0:
         logger.warning("Collection is empty; returning no search results.")
         return []
 
-    # If reranking, fetch a larger pool of candidates (e.g., top 20) for the CrossEncoder to score
     fetch_k = n_results * 4 if rerank else n_results
     n_results_per_query = max(1, min(fetch_k, total_docs))
     results = collection.query(
@@ -211,42 +264,50 @@ def semantic_search(
         include=["documents", "distances", "metadatas"],
     )
 
-    # Flatten and deduplicate results across all expanded queries
-    unique_hits = {}
-    for doc_list, dist_list, id_list, meta_list in zip(results["documents"], results["distances"], results["ids"], results["metadatas"]):
+    unique_hits: dict[str, dict] = {}
+    for doc_list, dist_list, id_list, meta_list in zip(
+        results["documents"],
+        results["distances"],
+        results["ids"],
+        results["metadatas"],
+    ):
         for doc, dist, chunk_id, meta in zip(doc_list, dist_list, id_list, meta_list):
-            score = round(1 - dist, 4)
-            # Keep the highest score if a chunk was found by multiple query variants
-            if chunk_id not in unique_hits or unique_hits[chunk_id]["score"] < score:
+            dense = round(1 - dist, 4)
+            if chunk_id not in unique_hits or unique_hits[chunk_id]["dense_score"] < dense:
                 unique_hits[chunk_id] = {
                     "id": chunk_id,
                     "text": doc,
-                    "score": score,
+                    "score": dense,
+                    "dense_score": dense,
                     "metadata": meta,
                 }
 
     hits_list = list(unique_hits.values())
 
-    # Apply Cross-Encoder Reranking
     if rerank and hits_list:
         try:
-            ce_model = _get_cross_encoder()
+            ce_model = _resolve_cross_encoder()
             original_query = queries[0]
-            # CrossEncoder expects pairs: [[query, doc1], [query, doc2], ...]
             pairs = [[original_query, hit["text"]] for hit in hits_list]
             logger.info(f"Reranking {len(pairs)} candidate chunks...")
-            
+
             ce_scores = ce_model.predict(pairs)
             for hit, ce_score in zip(hits_list, ce_scores):
-                hit["dense_score"] = hit["score"]  # Preserve original cosine similarity
-                hit["score"] = float(ce_score)     # Replace with reranker score
+                hit["rerank_score"] = float(ce_score)
         except Exception as e:
             logger.error(f"Reranking failed, falling back to dense scores: {e}")
 
-    # Sort by highest overall similarity (or reranker score)
-    sorted_hits = sorted(hits_list, key=lambda x: x["score"], reverse=True)
-    
-    final_n = n_results if rerank else n_results * max(1, len(queries) // 2)
+    if rerank and hits_list and hits_list[0].get("rerank_score") is not None:
+        sorted_hits = sorted(
+            hits_list,
+            key=lambda x: x.get("rerank_score", relevance_score(x)),
+            reverse=True,
+        )
+        final_n = n_results
+    else:
+        sorted_hits = sorted(hits_list, key=lambda x: relevance_score(x), reverse=True)
+        final_n = min(n_results * len(queries), len(sorted_hits))
+
     return sorted_hits[:final_n]
 
 
@@ -254,25 +315,24 @@ def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[d
     """
     Extract customer-only quotes from search results.
     Filters out interviewer lines and low-relevance chunks.
+    Uses dense/cosine similarity for thresholds, not cross-encoder scores.
     """
     import re
     from src.constants import INTERVIEWEE_PATTERN, INTERVIEWER_PATTERN
 
     quotes = []
     for hit in hits:
-        if hit["score"] < min_score:
+        if relevance_score(hit) < min_score:
             continue
-            
+
         meta = hit.get("metadata", {})
         source = f"{meta.get('interview_name', 'Unknown')} ({meta.get('participant_name', 'Unknown')})"
-        
-        # Extract customer lines specifically
+
         lines = hit["text"].split("\n")
         capturing = False
         for line in lines:
             if INTERVIEWEE_PATTERN.match(line):
                 capturing = True
-                # Strip the speaker prefix (everything up to the first colon)
                 text = re.sub(r"^[^:]+:\s*", "", line).strip()
                 if text:
                     quotes.append({"text": text, "source": source})
@@ -281,7 +341,6 @@ def extract_quotes_from_hits(hits: list[dict], min_score: float = 0.3) -> list[d
             elif capturing and line.strip():
                 quotes.append({"text": line.strip(), "source": source})
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for q in quotes:

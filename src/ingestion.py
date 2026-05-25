@@ -140,6 +140,20 @@ def get_full_text(chunks: list[dict]) -> str:
     return "\n\n".join(c["text"] for c in chunks)
 
 
+def chunks_from_interviews(entries: list[dict]) -> list[dict]:
+    """Chunk all interview transcripts and attach retrieval metadata."""
+    all_chunks: list[dict] = []
+    for entry in entries:
+        chunks = chunk_transcript(entry["text"])
+        inv_name = entry.get("name") or "Unknown"
+        part_name = entry.get("participant_name") or "Unknown"
+        for c in chunks:
+            c["interview_name"] = inv_name
+            c["participant_name"] = part_name
+        all_chunks.extend(chunks)
+    return all_chunks
+
+
 def transcribe_audio(audio_bytes: bytes, file_name: str, prompt: str | None = None) -> str:
     """
     Transcribe an audio file using OpenAI's Whisper API.

@@ -11,7 +11,6 @@ import os
 import re
 import html
 import sys
-import hashlib
 from collections import Counter
 from pathlib import Path
 
@@ -24,16 +23,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from src.ingestion import load_transcript, chunk_transcript, get_full_text
-from src.retrieval import build_index, semantic_search, extract_quotes_from_hits
+from src.ingestion import (
+    load_transcript,
+    chunk_transcript,
+    get_full_text,
+    chunks_from_interviews,
+)
+from src.retrieval import (
+    build_index,
+    semantic_search,
+    extract_quotes_from_hits,
+    format_hit_score,
+)
+from src.retrieval_streamlit import install_streamlit_model_caches
 from src.insights import (
-    extract_themes,
     extract_aggregate_insights,
     generate_evidence_insight,
     answer_research_query,
 )
 from src.evaluation import evaluate_insights
 
+install_streamlit_model_caches()
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -190,7 +200,6 @@ def save_app_state():
     state_file.parent.mkdir(exist_ok=True)
     state = {
         "project_entries": st.session_state.project_entries,
-        "all_chunks": st.session_state.all_chunks,
         "research_chat": st.session_state.research_chat,
         "aggregate_insights": st.session_state.aggregate_insights,
         "evaluation_data": st.session_state.evaluation_data,
@@ -230,18 +239,18 @@ def init_session_state():
         saved_state = load_app_state()
         if saved_state and saved_state.get("project_entries"):
             st.session_state.project_entries = saved_state.get("project_entries", [])
-            st.session_state.all_chunks = saved_state.get("all_chunks", [])
             st.session_state.research_chat = saved_state.get("research_chat", [])
             st.session_state.aggregate_insights = saved_state.get("aggregate_insights", None)
             st.session_state.evaluation_data = saved_state.get("evaluation_data", None)
+            sync_project_chunks()
+            if st.session_state.all_chunks:
+                st.session_state._needs_collection_rebuild = True
         st.session_state._state_loaded = True
 
 
-def load_sample_transcript() -> str:
-    sample_path = Path(__file__).parent / "sample_data" / "sample_interview.txt"
-    if sample_path.exists():
-        return sample_path.read_text(encoding="utf-8")
-    return ""
+def sync_project_chunks() -> None:
+    """Rebuild indexed chunks from project entries (single source of truth)."""
+    st.session_state.all_chunks = chunks_from_interviews(st.session_state.project_entries)
 
 
 def refresh_collection(backend: str):
@@ -274,7 +283,7 @@ with st.sidebar:
         "### No-key / local mode\n"
         "- Set `Embedding backend` to **local** for free, on-device embeddings.\n"
         "- Local embeddings do not require an API key.\n"
-        "- LLM insight generation still needs `OPENAI_API_KEY` or `GEMINI_API_KEY`."
+        "- LLM features need `OPENAI_API_KEY`, `GEMINI_API_KEY`, or a local **Ollama** server."
     )
 
     if embedding_backend == "openai" and not openai_key:
@@ -323,6 +332,17 @@ if st.session_state.last_embedding_backend != embedding_backend:
         st.session_state.collection = None
         st.sidebar.error(f"Could not build embedders: {exc}")
 
+if st.session_state.get("_needs_collection_rebuild") and st.session_state.all_chunks:
+    st.session_state._needs_collection_rebuild = False
+    try:
+        if embedding_backend == "openai" and not openai_key:
+            st.session_state.collection = None
+        else:
+            refresh_collection(embedding_backend)
+    except Exception as exc:
+        st.session_state.collection = None
+        st.sidebar.error(f"Could not rebuild index from saved project: {exc}")
+
 
 tabs = st.tabs([
     "Dashboard",
@@ -369,19 +389,6 @@ with tabs[0]:
     )
 
 
-def _set_sample_transcript():
-    sample = load_sample_transcript()
-    if sample:
-        st.session_state.pending_transcript = sample
-        st.session_state.pending_name = "Sample interview"
-        st.session_state.pending_participant_name = "Sample participant"
-        st.session_state.pending_segment = "Product research"
-        st.session_state.pending_role = "Product manager"
-        st.session_state.pending_notes = "Loaded from sample data for quick testing."
-    else:
-        st.error("Sample transcript file not found.")
-
-
 def _load_demo_project():
     """Instantly inject 3 realistic mock interviews to let users test cross-session insights."""
     demo_interviews = [
@@ -411,16 +418,8 @@ def _load_demo_project():
         }
     ]
 
-    st.session_state.project_entries = []
-    st.session_state.all_chunks = []
-    
-    for entry in demo_interviews:
-        chunks = chunk_transcript(entry["text"])
-        for c in chunks:
-            c["interview_name"] = entry["name"]
-            c["participant_name"] = entry["participant_name"]
-        st.session_state.all_chunks.extend(chunks)
-        st.session_state.project_entries.append(entry)
+    st.session_state.project_entries = list(demo_interviews)
+    sync_project_chunks()
         
     st.session_state.search_results = None
     st.session_state.research_chat = []
@@ -450,6 +449,26 @@ def _clear_intake_form():
     st.session_state.pending_segment = ""
     st.session_state.pending_role = ""
     st.session_state.pending_notes = ""
+
+
+def _esc(text) -> str:
+    """Escape user/LLM text before embedding in HTML."""
+    return html.escape(str(text)) if text is not None else ""
+
+
+def _safe_css_token(value: str, default: str = "neutral") -> str:
+    """Restrict LLM-provided tokens used in CSS class names."""
+    token = re.sub(r"[^a-z0-9_-]", "", str(value).lower())
+    return token or default
+
+
+def render_chat_markdown(content: str) -> None:
+    """Render chat messages with Markdown but without raw HTML."""
+    st.markdown(content, unsafe_allow_html=False)
+
+
+def render_chat_quote(quote: str) -> None:
+    st.markdown(f"- {_esc(quote)}", unsafe_allow_html=False)
 
 
 def highlight_keywords(text: str, query: str) -> str:
@@ -602,9 +621,7 @@ with tabs[1]:
             remove_idx = st.session_state.pop("pending_remove_index")
             if 0 <= remove_idx < len(st.session_state.project_entries):
                 st.session_state.project_entries.pop(remove_idx)
-                st.session_state.all_chunks = []
-                for remaining_entry in st.session_state.project_entries:
-                    st.session_state.all_chunks.extend(chunk_transcript(remaining_entry["text"]))
+                sync_project_chunks()
                 st.session_state.search_results = None
                 st.session_state.research_chat = []
                 st.session_state.aggregate_insights = None
@@ -712,7 +729,9 @@ with tabs[3]:
                 for hit in results["hits"]:
                     meta = hit.get("metadata", {})
                     source_label = f"{meta.get('interview_name', 'Unknown')} ({meta.get('participant_name', 'Unknown')})"
-                    with st.expander(f"Chunk {hit['id']} · relevance {hit['score']:.3f} · {source_label}"):
+                    with st.expander(
+                        f"Chunk {hit['id']} · {format_hit_score(hit)} · {source_label}"
+                    ):
                         highlighted_chunk = highlight_keywords(hit["text"], results["query"])
                         st.markdown(
                             f'<div style="white-space: pre-wrap; font-size: 0.9rem;">{highlighted_chunk}</div>',
@@ -729,11 +748,11 @@ with tabs[3]:
                     # Render existing chat
                     for msg in st.session_state.research_chat:
                         with st.chat_message(msg["role"]):
-                            st.markdown(msg["content"])
+                            render_chat_markdown(msg["content"])
                             if msg["role"] == "assistant" and msg.get("supporting_quotes"):
                                 with st.expander("Supporting quotes"):
                                     for q in msg["supporting_quotes"]:
-                                        st.markdown(f"- {q}")
+                                        render_chat_quote(q)
 
                     if not st.session_state.research_chat:
                         if st.button("Generate summary & start chat", type="primary"):
@@ -748,7 +767,10 @@ with tabs[3]:
                                     )
                                     ans_text = assistant.get('answer', '')
                                     if assistant.get('recommended_next_steps'):
-                                        ans_text += f"\n\n**Recommended next step:** {assistant.get('recommended_next_steps')}"
+                                        ans_text += (
+                                            f"\n\n**Recommended next step:** "
+                                            f"{_esc(assistant.get('recommended_next_steps'))}"
+                                        )
                                     
                                     st.session_state.research_chat.append({
                                         "role": "user",
@@ -778,7 +800,7 @@ with tabs[3]:
                         if submit_chat and follow_up:
                             st.session_state.research_chat.append({"role": "user", "content": follow_up})
                             with st.chat_message("user"):
-                                st.markdown(follow_up)
+                                render_chat_markdown(follow_up)
                             
                             with st.chat_message("assistant"):
                                 with st.spinner("Thinking..."):
@@ -792,13 +814,16 @@ with tabs[3]:
                                         )
                                         ans_text = assistant.get('answer', '')
                                         if assistant.get('recommended_next_steps'):
-                                            ans_text += f"\n\n**Recommended next step:** {assistant.get('recommended_next_steps')}"
+                                            ans_text += (
+                                                f"\n\n**Recommended next step:** "
+                                                f"{_esc(assistant.get('recommended_next_steps'))}"
+                                            )
                                             
-                                        st.markdown(ans_text)
+                                        render_chat_markdown(ans_text)
                                         if assistant.get('supporting_quotes'):
                                             with st.expander("Supporting quotes"):
                                                 for q in assistant['supporting_quotes']:
-                                                    st.markdown(f"- {q}")
+                                                    render_chat_quote(q)
                                                     
                                         st.session_state.research_chat.append({
                                             "role": "assistant",
@@ -859,39 +884,39 @@ with tabs[3]:
                     st.error(f"Evidence insight failed: {e}")
                     logger.exception("Evidence insight error")
 
-            if st.session_state.evidence_insight:
-                ev = st.session_state.evidence_insight
-                confidence = ev.get("confidence", "medium")
+        if st.session_state.evidence_insight:
+            ev = st.session_state.evidence_insight
+            confidence = _safe_css_token(ev.get("confidence", "medium"), "medium")
 
+            st.markdown(
+                f'<div class="insight-card">'
+                f'<h4>INSIGHT <span style="opacity:0.5">·</span> '
+                f'<span style="font-size:0.75rem; background:rgba(255,255,255,0.15); '
+                f'padding:2px 10px; border-radius:20px;">{_esc(confidence)} confidence</span></h4>'
+                f'<p style="font-size:1.15rem; font-family:\'DM Serif Display\', serif; '
+                f'margin:0 0 1.25rem; line-height:1.5;">{_esc(ev.get("insight", ""))}</p>'
+                f'<hr style="border-color:rgba(255,255,255,0.15); margin:1rem 0;">'
+                f'<h4>SUPPORTING EVIDENCE</h4>',
+                unsafe_allow_html=True,
+            )
+
+            evidence = ev.get("evidence", [])
+            for quote in evidence:
                 st.markdown(
-                    f'<div class="insight-card">'
-                    f'<h4>INSIGHT <span style="opacity:0.5">·</span> '
-                    f'<span style="font-size:0.75rem; background:rgba(255,255,255,0.15); '
-                    f'padding:2px 10px; border-radius:20px;">{confidence} confidence</span></h4>'
-                    f'<p style="font-size:1.15rem; font-family:\'DM Serif Display\', serif; '
-                    f'margin:0 0 1.25rem; line-height:1.5;">{ev.get("insight", "")}</p>'
-                    f'<hr style="border-color:rgba(255,255,255,0.15); margin:1rem 0;">'
-                    f'<h4>SUPPORTING EVIDENCE</h4>',
+                    f'<div style="background:rgba(255,255,255,0.08); border-radius:8px; '
+                    f'padding:0.75rem 1rem; margin-bottom:0.5rem; font-style:italic; '
+                    f'font-size:0.9rem;">&ldquo;{_esc(quote)}&rdquo;</div>',
                     unsafe_allow_html=True,
                 )
 
-                evidence = ev.get("evidence", [])
-                for quote in evidence:
-                    st.markdown(
-                        f'<div style="background:rgba(255,255,255,0.08); border-radius:8px; '
-                        f'padding:0.75rem 1rem; margin-bottom:0.5rem; font-style:italic; '
-                        f'font-size:0.9rem;">"{quote}"</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                st.markdown(
-                    f'<hr style="border-color:rgba(255,255,255,0.15); margin:1rem 0;">'
-                    f'<h4>RECOMMENDATION</h4>'
-                    f'<p style="font-size:0.95rem; opacity:0.9; margin:0;">'
-                    f'{ev.get("recommendation", "")}</p>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+            st.markdown(
+                f'<hr style="border-color:rgba(255,255,255,0.15); margin:1rem 0;">'
+                f'<h4>RECOMMENDATION</h4>'
+                f'<p style="font-size:0.95rem; opacity:0.9; margin:0;">'
+                f'{_esc(ev.get("recommendation", ""))}</p>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
 with tabs[2]:
     # Insights tab — generate and browse aggregate insights
@@ -955,16 +980,16 @@ with tabs[2]:
             data = st.session_state.aggregate_insights
 
             # Overall sentiment banner
-            sentiment = data.get("overall_sentiment", "unknown")
+            sentiment = _safe_css_token(data.get("overall_sentiment", "unknown"), "unknown")
             sentiment_summary = data.get("sentiment_summary", "")
             badge_class = f"badge-{sentiment}"
             st.markdown(
                 f'<div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; '
                 f'padding:1rem 1.5rem; margin-bottom:1.5rem;">'
                 f'<strong>Overall Sentiment</strong> &nbsp; '
-                f'<span class="{badge_class}">{sentiment.upper()}</span><br>'
+                f'<span class="{badge_class}">{_esc(sentiment.upper())}</span><br>'
                 f'<span style="color:#475569; font-size:0.9rem; margin-top:0.25rem; display:block;">'
-                f'{sentiment_summary}</span></div>',
+                f'{_esc(sentiment_summary)}</span></div>',
                 unsafe_allow_html=True,
             )
 
@@ -982,14 +1007,14 @@ with tabs[2]:
                 themes = data.get("themes", [])
                 if themes:
                     for t in themes:
-                        freq = t.get("frequency", "medium")
-                        sent = t.get("sentiment", "neutral")
+                        freq = _safe_css_token(t.get("frequency", "medium"), "medium")
+                        sent = _safe_css_token(t.get("sentiment", "neutral"), "neutral")
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>{t["title"]}</strong> &nbsp;'
-                            f'<span class="badge-{freq}">{freq}</span> &nbsp;'
-                            f'<span class="badge-{sent}">{sent}</span>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{t["description"]}</p>'
+                            f'<strong>{_esc(t.get("title", ""))}</strong> &nbsp;'
+                            f'<span class="badge-{freq}">{_esc(freq)}</span> &nbsp;'
+                            f'<span class="badge-{sent}">{_esc(sent)}</span>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(t.get("description", ""))}</p>'
                             f'</div>',
                             unsafe_allow_html=True,
                         )
@@ -1000,14 +1025,14 @@ with tabs[2]:
                 pain_points = data.get("pain_points", [])
                 if pain_points:
                     for p in pain_points:
-                        severity = p.get("severity", "moderate")
+                        severity = _safe_css_token(p.get("severity", "moderate"), "moderate")
                         quote = p.get("quote", "")
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>{p["title"]}</strong> &nbsp;'
-                            f'<span class="badge-{severity}">{severity}</span>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{p["description"]}</p>'
-                            + (f'<div class="quote-card" style="margin-top:0.75rem;"><div class="quote-text">"{quote}"</div></div>' if quote else "")
+                            f'<strong>{_esc(p.get("title", ""))}</strong> &nbsp;'
+                            f'<span class="badge-{severity}">{_esc(severity)}</span>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(p.get("description", ""))}</p>'
+                            + (f'<div class="quote-card" style="margin-top:0.75rem;"><div class="quote-text">&ldquo;{_esc(quote)}&rdquo;</div></div>' if quote else "")
                             + f'</div>',
                             unsafe_allow_html=True,
                         )
@@ -1021,9 +1046,9 @@ with tabs[2]:
                         quote = f.get("quote", "")
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>🔧 {f["title"]}</strong>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{f["description"]}</p>'
-                            + (f'<div class="quote-card" style="margin-top:0.75rem;"><div class="quote-text">"{quote}"</div></div>' if quote else "")
+                            f'<strong>🔧 {_esc(f.get("title", ""))}</strong>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(f.get("description", ""))}</p>'
+                            + (f'<div class="quote-card" style="margin-top:0.75rem;"><div class="quote-text">&ldquo;{_esc(quote)}&rdquo;</div></div>' if quote else "")
                             + f'</div>',
                             unsafe_allow_html=True,
                         )
@@ -1036,8 +1061,8 @@ with tabs[2]:
                     for t in trends:
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>{t.get("signal", "Trend")}</strong>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{t.get("description", "")}</p>'
+                            f'<strong>{_esc(t.get("signal", "Trend"))}</strong>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(t.get("description", ""))}</p>'
                             f'</div>',
                             unsafe_allow_html=True,
                         )
@@ -1048,11 +1073,11 @@ with tabs[2]:
                 findings = data.get("cross_session_findings", [])
                 if findings:
                     for f in findings:
-                        sessions = ", ".join(f.get("supporting_sessions", []))
+                        sessions = ", ".join(_esc(s) for s in f.get("supporting_sessions", []))
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>{f["title"]}</strong>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{f["description"]}</p>'
+                            f'<strong>{_esc(f.get("title", ""))}</strong>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(f.get("description", ""))}</p>'
                             f'<p style="margin:0.5rem 0 0; font-size:0.8rem; color:#64748b;">Supporting sessions: {sessions}</p>'
                             f'</div>',
                             unsafe_allow_html=True,
@@ -1064,12 +1089,12 @@ with tabs[2]:
                 recs = data.get("recommendations", [])
                 if recs:
                     for r in recs:
-                        priority = r.get("priority", "medium")
+                        priority = _safe_css_token(r.get("priority", "medium"), "medium")
                         st.markdown(
                             f'<div class="theme-card">'
-                            f'<strong>{r["title"]}</strong> &nbsp;'
-                            f'<span class="badge-{priority}">{priority} priority</span>'
-                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{r["description"]}</p>'
+                            f'<strong>{_esc(r.get("title", ""))}</strong> &nbsp;'
+                            f'<span class="badge-{priority}">{_esc(priority)} priority</span>'
+                            f'<p style="margin:0.5rem 0 0; color:#475569; font-size:0.9rem;">{_esc(r.get("description", ""))}</p>'
                             f'</div>',
                             unsafe_allow_html=True,
                         )
